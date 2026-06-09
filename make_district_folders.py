@@ -1,11 +1,9 @@
 """
 create_district_folders.py
-
-Creates one subfolder per district in the same directory as this script.
-Already-existing folders are skipped automatically.
 """
 
 import os
+import sys
 
 DISTRICTS = [
     "Alameda Unified",
@@ -28,20 +26,23 @@ DISTRICTS = [
     "Sunol Glen Unified",
 ]
 
-# Always resolve relative to this script's location (Ten-Strands folder)
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TARGET_DIR = r"C:\Users\caden\Documents\Ten Strands\PDFs\Alameda"
+
+if not os.path.isdir(TARGET_DIR):
+    print(f"\nError: '{TARGET_DIR}' is not a valid directory.")
+    sys.exit(1)
 
 created, skipped = [], []
 
 for district in DISTRICTS:
-    folder_path = os.path.join(BASE_DIR, district)
+    folder_path = os.path.join(TARGET_DIR, district)
     if os.path.exists(folder_path):
         skipped.append(district)
     else:
         os.makedirs(folder_path)
         created.append(district)
 
-print(f"\nBase directory: {BASE_DIR}\n")
+print(f"\nTarget: {TARGET_DIR}\n")
 
 if created:
     print(f"✓ Created ({len(created)}):")
