@@ -48,8 +48,10 @@ END_ROW = 315
 START_COL = 5  # E
 END_COL = 60  # BH
 GROUP_WIDTH = 4
-REQUEST_DELAY_SECONDS = 1.0
-TIMEOUT_SECONDS = 20
+REQUEST_DELAY_SECONDS = 0.0
+TIMEOUT_SECONDS = 8
+SEARCH_MAX_RESULTS = 4
+DATABASE_SEARCH_MAX_RESULTS = 3
 
 GREEN_FILL = PatternFill("solid", fgColor="C6EFCE")
 RED_FILL = PatternFill("solid", fgColor="FFC7CE")
@@ -61,6 +63,13 @@ USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36"
 )
+POLICY_HOST_MARKERS = [
+    "simbli.eboardsolutions.com",
+    "go.boarddocs.com",
+    "gamutonline.net",
+    "boardpolicyonline.com",
+    "agendaonline.net",
+]
 
 
 @dataclass
@@ -113,7 +122,9 @@ def save_cache(path: Path, cache: dict) -> None:
     path.write_text(json.dumps(cache, indent=2, sort_keys=True), encoding="utf-8")
 
 
-def request_url(url: str, timeout: int = TIMEOUT_SECONDS) -> FetchResult:
+def request_url(url: str, timeout: int | None = None) -> FetchResult:
+    if timeout is None:
+        timeout = TIMEOUT_SECONDS
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as response:
@@ -192,7 +203,7 @@ def extract_years(text: str) -> tuple[str | None, str | None]:
     return adopted, revised
 
 
-def html_search(query: str, cache: dict, max_results: int = 8) -> list[str]:
+def html_search(query: str, cache: dict, max_results: int = SEARCH_MAX_RESULTS) -> list[str]:
     key = f"search::{query}"
     if key in cache:
         return cache[key]
@@ -228,8 +239,6 @@ def html_search(query: str, cache: dict, max_results: int = 8) -> list[str]:
 def search_queries(district: str, policy: PolicyGroup) -> Iterable[str]:
     quoted_district = f'"{district}"'
     yield f'{quoted_district} "{policy.code}" "{policy.title}" board policy'
-    yield f'{quoted_district} "{policy.code}" board policy'
-    yield f'{quoted_district} "{policy.title}" "simbli"'
     yield f'{quoted_district} "{policy.code}" site:simbli.eboardsolutions.com'
     yield f'{quoted_district} "{policy.code}" site:go.boarddocs.com'
 
@@ -242,9 +251,18 @@ def result_matches_policy(url: str, text: str, policy: PolicyGroup) -> bool:
     return code in haystack or code_without_space in compact
 
 
+def candidate_is_policy_system(url: str, policy: PolicyGroup) -> bool:
+    lowered = url.lower()
+    code = policy.code.lower().replace(" ", "")
+    compact_url = lowered.replace("%20", "").replace("-", "").replace("_", "")
+    return any(marker in lowered for marker in POLICY_HOST_MARKERS) or code in compact_url
+
+
 def find_policy_link(district: str, policy: PolicyGroup, cache: dict) -> tuple[str | None, str | None, str | None]:
     for query in search_queries(district, policy):
         for candidate in html_search(query, cache):
+            if not candidate_is_policy_system(candidate, policy):
+                continue
             fetched = cached_fetch(candidate, cache)
             if page_looks_expired(fetched):
                 continue
@@ -262,9 +280,9 @@ def district_policy_database_exists(district: str, cache: dict) -> bool:
         f'"{district}" "BoardDocs"',
     ]
     for query in queries:
-        for link in html_search(query, cache, max_results=5):
+        for link in html_search(query, cache, max_results=DATABASE_SEARCH_MAX_RESULTS):
             lowered = link.lower()
-            if any(host in lowered for host in ["simbli.eboardsolutions.com", "go.boarddocs.com", "gamutonline.net"]):
+            if any(host in lowered for host in POLICY_HOST_MARKERS):
                 return True
     return False
 
@@ -308,6 +326,12 @@ def set_changed(ws, row: int, col: int, value: str, fill: PatternFill) -> bool:
     cell.value = value
     mark_cell(cell, fill)
     return True
+
+
+def save_workbook_atomic(wb, output_path: Path) -> None:
+    tmp_path = output_path.with_name(f"{output_path.stem}.tmp{output_path.suffix}")
+    wb.save(tmp_path)
+    tmp_path.replace(output_path)
 
 
 def process_existing_policy(ws, row: int, policy: PolicyGroup, district: str, cache: dict) -> list[str]:
@@ -407,7 +431,7 @@ def generate_review(
             continue
 
         row_notes: list[str] = []
-        print(f"Row {row}: {district}")
+        print(f"Row {row}: {district}", flush=True)
         for policy in groups:
             value = normalize_cell(ws.cell(row, policy.value_col).value)
             if value in {"1", "1.0"}:
@@ -421,13 +445,13 @@ def generate_review(
             ws.cell(row, summary_col).value = summary
             mark_cell(ws.cell(row, summary_col), YELLOW_FILL)
 
-        wb.save(output_path)
+        save_workbook_atomic(wb, output_path)
 
-    wb.save(output_path)
+    save_workbook_atomic(wb, output_path)
 
 
 def main() -> None:
-    global REQUEST_DELAY_SECONDS
+    global REQUEST_DELAY_SECONDS, TIMEOUT_SECONDS
 
     parser = argparse.ArgumentParser(description="Generate Caden policy review workbook.")
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
@@ -436,9 +460,11 @@ def main() -> None:
     parser.add_argument("--start-row", type=int, default=START_ROW)
     parser.add_argument("--end-row", type=int, default=END_ROW)
     parser.add_argument("--delay", type=float, default=REQUEST_DELAY_SECONDS)
+    parser.add_argument("--timeout", type=int, default=TIMEOUT_SECONDS)
     args = parser.parse_args()
 
     REQUEST_DELAY_SECONDS = args.delay
+    TIMEOUT_SECONDS = args.timeout
 
     generate_review(args.input, args.output, args.cache, args.start_row, args.end_row)
     print(f"Review workbook written to: {args.output.resolve()}")
