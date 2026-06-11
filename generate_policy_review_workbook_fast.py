@@ -301,7 +301,9 @@ def cached_fetch(
     if cached is not None:
         return FetchResult(**cached)
     result = request_url(url, timeout, budget)
-    cache.set(key, result.__dict__)
+    is_bot_blocked = "Pardon Our Interruption" in result.text and "bot" in result.text.lower()
+    if not is_bot_blocked:
+        cache.set(key, result.__dict__)
     if delay:
         time.sleep(delay)
     return result
@@ -333,14 +335,20 @@ def visible_text(html: str) -> str:
 def extract_years(text: str) -> tuple[str | None, str | None]:
     adopted = None
     revised = None
+    # Patterns handle both bare-year format ("Adopted: 2012") and
+    # MM/DD/YYYY format as used by Simbli ("Original Adopted Date: 09/06/2012").
+    # The optional (?:Date)? absorbs the word "Date" after the label.
+    # The optional (?:\d{1,2}[/.-]\d{1,2}[/.-])? absorbs "MM/DD/" or "MM-DD-".
     adopted_patterns = [
-        r"\bAdopted\s*:?\s*(?:[^0-9]{0,30})((?:19|20)\d{2})",
-        r"\bApproved\s*:?\s*(?:[^0-9]{0,30})((?:19|20)\d{2})",
+        r"\bAdopted\s*(?:Date)?\s*:?\s*(?:[^0-9]{0,20})?(?:\d{1,2}[/.-]\d{1,2}[/.-])?((?:19|20)\d{2})",
+        r"\bApproved\s*(?:Date)?\s*:?\s*(?:[^0-9]{0,20})?(?:\d{1,2}[/.-]\d{1,2}[/.-])?((?:19|20)\d{2})",
+        r"\bOriginal\s+Adopted\s*(?:Date)?\s*:?\s*(?:\d{1,2}[/.-]\d{1,2}[/.-])?((?:19|20)\d{2})",
     ]
     revised_patterns = [
-        r"\bRevised\s*:?\s*(?:[^0-9]{0,30})((?:19|20)\d{2})",
-        r"\bLast\s+Revised\s*:?\s*(?:[^0-9]{0,30})((?:19|20)\d{2})",
-        r"\bUpdated\s*:?\s*(?:[^0-9]{0,30})((?:19|20)\d{2})",
+        r"\bLast\s+Revised\s*(?:Date)?\s*:?\s*(?:\d{1,2}[/.-]\d{1,2}[/.-])?((?:19|20)\d{2})",
+        r"\bRevised\s*(?:Date)?\s*:?\s*(?:[^0-9]{0,20})?(?:\d{1,2}[/.-]\d{1,2}[/.-])?((?:19|20)\d{2})",
+        r"\bUpdated\s*(?:Date)?\s*:?\s*(?:[^0-9]{0,20})?(?:\d{1,2}[/.-]\d{1,2}[/.-])?((?:19|20)\d{2})",
+        r"\bLast\s+Reviewed\s*(?:Date)?\s*:?\s*(?:\d{1,2}[/.-]\d{1,2}[/.-])?((?:19|20)\d{2})",
     ]
     for pattern in adopted_patterns:
         match = re.search(pattern, text, re.IGNORECASE)
@@ -353,6 +361,7 @@ def extract_years(text: str) -> tuple[str | None, str | None]:
     if revised_matches:
         revised = max(revised_matches)
     return adopted, revised
+
 
 
 def html_search(
