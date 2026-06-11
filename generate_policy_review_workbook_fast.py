@@ -31,6 +31,7 @@ import requests
 
 try:
     from openpyxl import load_workbook
+    from openpyxl.styles import Alignment
     from openpyxl.styles import Font, PatternFill
     from openpyxl.utils import get_column_letter
 except ModuleNotFoundError as exc:
@@ -45,6 +46,7 @@ DEFAULT_INPUT = Path(
 )
 DEFAULT_OUTPUT = Path("caden_policy_review_rows_9_315_fast.xlsx")
 DEFAULT_CACHE = Path("policy_review_cache.json")
+DEFAULT_PROGRESS = Path("policy_review_fast_progress.json")
 
 SHEET_NAME = "Caden"
 HEADER_ROW = 2
@@ -54,13 +56,17 @@ START_COL = 5  # E
 END_COL = 60  # BH
 GROUP_WIDTH = 4
 
-TIMEOUT_SECONDS = 8
-REQUEST_DELAY_SECONDS = 0.0
+TIMEOUT_SECONDS = 5
+REQUEST_DELAY_SECONDS = 1.5
 SEARCH_MAX_RESULTS = 4
+SAFE_ROUTES_SEARCH_MAX_RESULTS = 10
 DATABASE_SEARCH_MAX_RESULTS = 3
-DEFAULT_WORKERS = 8
+DEFAULT_WORKERS = 3
+DEFAULT_SEARCH_INTERVAL = 2.0  # minimum seconds between any two DDG search requests
 DEFAULT_CACHE_SAVE_INTERVAL = 10
 DEFAULT_WORKBOOK_SAVE_INTERVAL = 10
+DEFAULT_MAX_REQUESTS_PER_ROW = 200
+DEFAULT_ROW_HEIGHT = 15
 
 GREEN_FILL_NAME = "green"
 RED_FILL_NAME = "red"
@@ -70,6 +76,7 @@ GREEN_FILL = PatternFill("solid", fgColor="C6EFCE")
 RED_FILL = PatternFill("solid", fgColor="FFC7CE")
 YELLOW_FILL = PatternFill("solid", fgColor="FFEB9C")
 CHANGED_FONT = Font(bold=True)
+LINK_ALIGNMENT = Alignment(horizontal="left", shrink_to_fit=False, wrap_text=True)
 
 SEARCH_URL = "https://duckduckgo.com/html/?q={query}"
 USER_AGENT = (
@@ -83,8 +90,36 @@ POLICY_HOST_MARKERS = [
     "boardpolicyonline.com",
     "agendaonline.net",
 ]
+SAFE_ROUTES_CODE = "5142.2"
+SAFE_ROUTES_PHRASE = "safe routes to school"
 
 thread_local = threading.local()
+
+# Global rate limiter: ensures all threads together fire at most 1 DDG search
+# every DEFAULT_SEARCH_INTERVAL seconds, preventing anti-bot throttling.
+class SearchRateLimiter:
+    """Thread-safe rate limiter for DuckDuckGo HTML search requests.
+
+    All worker threads share a single instance. A global lock ensures requests
+    are serialized so DDG never sees a burst of concurrent queries.
+    """
+
+    def __init__(self, min_interval: float = DEFAULT_SEARCH_INTERVAL):
+        self._lock = threading.Lock()
+        self._min_interval = min_interval
+        self._last_request_time: float = 0.0
+
+    def wait(self) -> None:
+        """Block until it is safe to fire the next search request."""
+        with self._lock:
+            now = time.monotonic()
+            gap = self._min_interval - (now - self._last_request_time)
+            if gap > 0:
+                time.sleep(gap)
+            self._last_request_time = time.monotonic()
+
+
+_search_rate_limiter = SearchRateLimiter()
 
 
 @dataclass(frozen=True)
@@ -133,6 +168,17 @@ class RowResult:
     notes: list[str] = field(default_factory=list)
     updates: list[CellUpdate] = field(default_factory=list)
     marks: list[CellMark] = field(default_factory=list)
+
+
+@dataclass
+class RequestBudget:
+    remaining: int
+
+    def take(self) -> bool:
+        if self.remaining <= 0:
+            return False
+        self.remaining -= 1
+        return True
 
 
 class ThreadSafeCache:
@@ -189,16 +235,49 @@ def is_url(value: str) -> bool:
 
 
 def extract_policy_parts(label: str) -> tuple[str, str]:
-    base = re.split(r"\s+[-\u2013]\s+", label, maxsplit=1)[0].strip()
-    match = re.match(r"^(BP|AR)\s+([0-9.]+)\s+(.+)$", base, re.IGNORECASE)
-    if not match:
-        return "", base
-    return f"{match.group(1).upper()} {match.group(2)}", match.group(3).strip()
+    match = re.match(r"^(BP|AR)\s+([0-9.]+)(?:\s+[-\u2013]\s+|\s+)?(.*)$", label, re.IGNORECASE)
+    if match:
+        return f"{match.group(1).upper()} {match.group(2)}", match.group(3).strip()
+    return "", label.strip()
 
 
-def request_url(url: str, timeout: int) -> FetchResult:
+def is_safe_routes_policy(policy: PolicyGroup) -> bool:
+    return SAFE_ROUTES_CODE in policy.code or SAFE_ROUTES_PHRASE in policy.title.lower()
+
+
+def policy_code_variants(policy: PolicyGroup) -> list[str]:
+    variants = [policy.code.lower()]
+    if is_safe_routes_policy(policy):
+        doc_type = policy.code.split()[0].lower() if policy.code else ""
+        variants.extend(
+            [
+                SAFE_ROUTES_CODE,
+                f"{SAFE_ROUTES_CODE}(a)",
+                f"{SAFE_ROUTES_CODE} (a)",
+                f"{doc_type} {SAFE_ROUTES_CODE}",
+                f"{doc_type} {SAFE_ROUTES_CODE}(a)",
+                f"{doc_type} {SAFE_ROUTES_CODE} (a)",
+            ]
+        )
+    deduped: list[str] = []
+    for variant in variants:
+        if variant and variant not in deduped:
+            deduped.append(variant)
+    return deduped
+
+
+def normalized_policy_code_variants(policy: PolicyGroup) -> list[str]:
+    return [
+        re.sub(r"[\s._%()/-]+", "", variant)
+        for variant in policy_code_variants(policy)
+    ]
+
+
+def request_url(url: str, timeout: int, budget: RequestBudget | None = None) -> FetchResult:
+    if budget is not None and not budget.take():
+        return FetchResult(False, url, None, "", "row request budget exhausted")
     try:
-        response = get_session().get(url, timeout=timeout, allow_redirects=True)
+        response = get_session().get(url, timeout=(3, timeout), allow_redirects=True)
         response.encoding = response.encoding or "utf-8"
         return FetchResult(
             ok=200 <= response.status_code < 400,
@@ -210,12 +289,18 @@ def request_url(url: str, timeout: int) -> FetchResult:
         return FetchResult(False, url, None, "", str(exc))
 
 
-def cached_fetch(url: str, cache: ThreadSafeCache, timeout: int, delay: float) -> FetchResult:
+def cached_fetch(
+    url: str,
+    cache: ThreadSafeCache,
+    timeout: int,
+    delay: float,
+    budget: RequestBudget | None = None,
+) -> FetchResult:
     key = f"fetch::{url}"
     cached = cache.get(key)
     if cached is not None:
         return FetchResult(**cached)
-    result = request_url(url, timeout)
+    result = request_url(url, timeout, budget)
     cache.set(key, result.__dict__)
     if delay:
         time.sleep(delay)
@@ -223,19 +308,18 @@ def cached_fetch(url: str, cache: ThreadSafeCache, timeout: int, delay: float) -
 
 
 def page_looks_expired(result: FetchResult) -> bool:
-    if not result.ok:
+    if result.status in (404, 410):
         return True
+    if not result.ok and result.status not in (401, 403):
+        return True
+
     text = result.text.lower()
     expired_markers = [
-        "404",
-        "not found",
+        "404 not found",
         "page cannot be found",
         "policy not found",
         "policy is no longer available",
-        "expired",
-        "access denied",
-        "permission denied",
-        "private?open",
+        "error 404",
     ]
     return any(marker in text for marker in expired_markers)
 
@@ -276,6 +360,7 @@ def html_search(
     cache: ThreadSafeCache,
     timeout: int,
     delay: float,
+    budget: RequestBudget | None = None,
     max_results: int = SEARCH_MAX_RESULTS,
 ) -> list[str]:
     key = f"search::{query}"
@@ -283,8 +368,12 @@ def html_search(
     if cached is not None:
         return cached
 
+    # Gate all live DDG requests through the global rate limiter so threads
+    # cannot pile up simultaneous requests and trigger anti-bot blocking.
+    _search_rate_limiter.wait()
+
     url = SEARCH_URL.format(query=urllib.parse.quote_plus(query))
-    result = request_url(url, timeout)
+    result = request_url(url, timeout, budget)
     links: list[str] = []
     if result.ok:
         for raw in re.findall(r'href="([^"]+)"', result.text):
@@ -314,6 +403,20 @@ def html_search(
 
 def search_queries(district: str, policy: PolicyGroup) -> Iterable[str]:
     quoted_district = f'"{district}"'
+    if is_safe_routes_policy(policy):
+        yield f'{quoted_district} "{SAFE_ROUTES_PHRASE}" {SAFE_ROUTES_CODE}'
+        yield f'{quoted_district} {SAFE_ROUTES_PHRASE} {SAFE_ROUTES_CODE}'
+        yield f'{quoted_district} "{SAFE_ROUTES_PHRASE}" "board policy"'
+        yield f'{quoted_district} {policy.code}'
+        yield f'{quoted_district} {policy.code} {SAFE_ROUTES_PHRASE} policy'
+        yield f'{quoted_district} {policy.code} site:simbli.eboardsolutions.com'
+        yield f'{quoted_district} {policy.code} site:go.boarddocs.com'
+        yield f'{quoted_district} {policy.code} site:gamutonline.net'
+        yield f'{quoted_district} "{SAFE_ROUTES_PHRASE}" site:simbli.eboardsolutions.com'
+        yield f'{quoted_district} "{SAFE_ROUTES_PHRASE}" site:go.boarddocs.com'
+        yield f'{quoted_district} "{SAFE_ROUTES_PHRASE}" site:gamutonline.net'
+        return
+
     yield f'{quoted_district} "{policy.code}" "{policy.title}" board policy'
     yield f'{quoted_district} "{policy.code}" site:simbli.eboardsolutions.com'
     yield f'{quoted_district} "{policy.code}" site:go.boarddocs.com'
@@ -321,17 +424,44 @@ def search_queries(district: str, policy: PolicyGroup) -> Iterable[str]:
 
 def result_matches_policy(url: str, text: str, policy: PolicyGroup) -> bool:
     haystack = f"{url} {text}".lower()
-    compact = haystack.replace(" ", "")
-    code = policy.code.lower()
-    code_without_space = code.replace(" ", "")
-    return code in haystack or code_without_space in compact
+    compact = re.sub(r"[\s._%()/-]+", "", haystack)
+    code_match = any(
+        variant in haystack or normalized in compact
+        for variant, normalized in zip(policy_code_variants(policy), normalized_policy_code_variants(policy))
+    )
+    if is_safe_routes_policy(policy):
+        phrase_match = (
+            SAFE_ROUTES_PHRASE in haystack
+            or "safe routes" in haystack
+            or "saferoutes" in compact
+        )
+        policy_context = any(
+            term in compact
+            for term in [
+                "boardpolicy",
+                "administrativeregulation",
+                "policy51422",
+                "regulation51422",
+                "bp51422",
+                "ar51422",
+                "51422a",
+                "51422",
+                "policy",
+                "regulation"
+            ]
+        )
+        return code_match or (phrase_match and policy_context)
+    return code_match
 
 
 def candidate_is_policy_system(url: str, policy: PolicyGroup) -> bool:
     lowered = url.lower()
-    code = policy.code.lower().replace(" ", "")
     compact_url = lowered.replace("%20", "").replace("-", "").replace("_", "")
-    return any(marker in lowered for marker in POLICY_HOST_MARKERS) or code in compact_url
+    code_match = any(normalized in compact_url for normalized in normalized_policy_code_variants(policy))
+    safe_routes_url_match = is_safe_routes_policy(policy) and "saferoutestoschool" in compact_url
+    if is_safe_routes_policy(policy):
+        return True
+    return any(marker in lowered for marker in POLICY_HOST_MARKERS) or code_match or safe_routes_url_match
 
 
 def find_policy_link(
@@ -340,12 +470,14 @@ def find_policy_link(
     cache: ThreadSafeCache,
     timeout: int,
     delay: float,
+    budget: RequestBudget,
 ) -> tuple[str | None, str | None, str | None]:
     for query in search_queries(district, policy):
-        for candidate in html_search(query, cache, timeout, delay):
+        max_results = SAFE_ROUTES_SEARCH_MAX_RESULTS if is_safe_routes_policy(policy) else SEARCH_MAX_RESULTS
+        for candidate in html_search(query, cache, timeout, delay, budget, max_results):
             if not candidate_is_policy_system(candidate, policy):
                 continue
-            fetched = cached_fetch(candidate, cache, timeout, delay)
+            fetched = cached_fetch(candidate, cache, timeout, delay, budget)
             if page_looks_expired(fetched):
                 continue
             text = visible_text(fetched.text)
@@ -360,6 +492,7 @@ def district_policy_database_exists(
     cache: ThreadSafeCache,
     timeout: int,
     delay: float,
+    budget: RequestBudget,
 ) -> bool:
     queries = [
         f'"{district}" "board policy"',
@@ -367,7 +500,7 @@ def district_policy_database_exists(
         f'"{district}" "BoardDocs"',
     ]
     for query in queries:
-        for link in html_search(query, cache, timeout, delay, DATABASE_SEARCH_MAX_RESULTS):
+        for link in html_search(query, cache, timeout, delay, budget, DATABASE_SEARCH_MAX_RESULTS):
             lowered = link.lower()
             if any(host in lowered for host in POLICY_HOST_MARKERS):
                 return True
@@ -400,6 +533,7 @@ def process_existing_policy(
     cache: ThreadSafeCache,
     timeout: int,
     delay: float,
+    budget: RequestBudget,
 ) -> None:
     district = snapshot.district
     link = snapshot.values.get(policy.link_col, "")
@@ -407,7 +541,9 @@ def process_existing_policy(
     old_revised = snapshot.values.get(policy.revised_col, "")
 
     if not is_url(link):
-        found_link, found_adopted, found_revised = find_policy_link(district, policy, cache, timeout, delay)
+        found_link, found_adopted, found_revised = find_policy_link(
+            district, policy, cache, timeout, delay, budget
+        )
         if found_link:
             add_update(result, snapshot, policy.link_col, found_link, GREEN_FILL_NAME)
             if found_adopted:
@@ -417,11 +553,13 @@ def process_existing_policy(
             result.notes.append(f"{policy.code}: found replacement link for existing policy")
         return
 
-    fetched = cached_fetch(link, cache, timeout, delay)
+    fetched = cached_fetch(link, cache, timeout, delay, budget)
     if page_looks_expired(fetched):
         add_mark(result, policy.value_col, RED_FILL_NAME)
         add_mark(result, policy.link_col, RED_FILL_NAME)
-        found_link, found_adopted, found_revised = find_policy_link(district, policy, cache, timeout, delay)
+        found_link, found_adopted, found_revised = find_policy_link(
+            district, policy, cache, timeout, delay, budget
+        )
         if found_link:
             add_update(result, snapshot, policy.link_col, found_link, RED_FILL_NAME)
             if found_adopted:
@@ -430,7 +568,9 @@ def process_existing_policy(
                 add_update(result, snapshot, policy.revised_col, found_revised, RED_FILL_NAME)
             result.notes.append(f"{policy.code}: original link expired; replacement found")
         else:
-            replacement = "N/A" if district_policy_database_exists(district, cache, timeout, delay) else "*"
+            replacement = "N/A" if district_policy_database_exists(
+                district, cache, timeout, delay, budget
+            ) else "*"
             add_update(result, snapshot, policy.link_col, replacement, RED_FILL_NAME)
             result.notes.append(f"{policy.code}: original link expired; no replacement found")
         return
@@ -463,8 +603,11 @@ def process_missing_policy(
     cache: ThreadSafeCache,
     timeout: int,
     delay: float,
+    budget: RequestBudget,
 ) -> None:
-    found_link, adopted, revised = find_policy_link(snapshot.district, policy, cache, timeout, delay)
+    found_link, adopted, revised = find_policy_link(
+        snapshot.district, policy, cache, timeout, delay, budget
+    )
     if not found_link:
         return
     add_update(result, snapshot, policy.value_col, "1", GREEN_FILL_NAME)
@@ -482,14 +625,21 @@ def process_row(
     cache: ThreadSafeCache,
     timeout: int,
     delay: float,
+    max_requests_per_row: int,
 ) -> RowResult:
     result = RowResult(row=snapshot.row)
-    for policy in groups:
+    budget = RequestBudget(max_requests_per_row)
+    # Process Safe Routes groups first so they are never budget-starved by earlier columns
+    prioritized = sorted(groups, key=lambda g: (0 if is_safe_routes_policy(g) else 1))
+    for policy in prioritized:
         value = snapshot.values.get(policy.value_col, "")
         if value in {"1", "1.0"}:
-            process_existing_policy(result, snapshot, policy, cache, timeout, delay)
+            process_existing_policy(result, snapshot, policy, cache, timeout, delay, budget)
         else:
-            process_missing_policy(result, snapshot, policy, cache, timeout, delay)
+            process_missing_policy(result, snapshot, policy, cache, timeout, delay, budget)
+        if budget.remaining <= 0:
+            result.notes.append("Row request budget exhausted before all policy checks completed")
+            break
     return result
 
 
@@ -521,6 +671,20 @@ def build_snapshots(ws, start_row: int, end_row: int) -> list[RowSnapshot]:
         values = {col: normalize_cell(ws.cell(row, col).value) for col in range(START_COL, END_COL + 1)}
         snapshots.append(RowSnapshot(row=row, district=district, values=values))
     return snapshots
+
+
+def policy_link_columns() -> list[int]:
+    return list(range(START_COL + GROUP_WIDTH - 1, END_COL + 1, GROUP_WIDTH))
+
+
+def apply_link_layout(ws, start_row: int, end_row: int) -> None:
+    for col in policy_link_columns():
+        ws.column_dimensions[get_column_letter(col)].width = 24
+        for row in range(HEADER_ROW, end_row + 1):
+            ws.cell(row, col).alignment = LINK_ALIGNMENT
+
+    for row in range(start_row, end_row + 1):
+        ws.row_dimensions[row].height = DEFAULT_ROW_HEIGHT
 
 
 def fill_for_name(name: str) -> PatternFill:
@@ -557,6 +721,18 @@ def save_workbook_atomic(wb, output_path: Path) -> None:
     tmp_path.replace(output_path)
 
 
+def save_progress_atomic(path: Path, completed_rows: set[int], total_rows: int) -> None:
+    payload = {
+        "completed_count": len(completed_rows),
+        "total_count": total_rows,
+        "completed_rows": sorted(completed_rows),
+        "last_updated": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    tmp_path = path.with_name(f"{path.stem}.tmp{path.suffix}")
+    tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp_path.replace(path)
+
+
 def generate_review(
     input_path: Path,
     output_path: Path,
@@ -568,26 +744,39 @@ def generate_review(
     workbook_save_interval: int,
     timeout: int,
     delay: float,
+    progress_path: Path,
+    max_requests_per_row: int,
 ) -> None:
     wb = load_workbook(input_path)
     if SHEET_NAME not in wb.sheetnames:
         raise SystemExit(f"Sheet not found: {SHEET_NAME}")
     ws = wb[SHEET_NAME]
-    groups = build_policy_groups(ws)
     snapshots = build_snapshots(ws, start_row, end_row)
+    groups = build_policy_groups(ws)
     cache = ThreadSafeCache(cache_path)
 
     summary_col = END_COL + 1
+    ws.insert_cols(summary_col)
     ws.cell(HEADER_ROW, summary_col).value = "Summary of Changes"
     ws.cell(HEADER_ROW, summary_col).font = Font(bold=True)
     ws.column_dimensions[get_column_letter(summary_col)].width = 80
+    apply_link_layout(ws, start_row, end_row)
 
     completed = 0
+    completed_rows: set[int] = set()
     print(f"Queued {len(snapshots)} district rows with {workers} workers.", flush=True)
     try:
         with ThreadPoolExecutor(max_workers=workers) as executor:
             future_to_snapshot = {
-                executor.submit(process_row, snapshot, groups, cache, timeout, delay): snapshot
+                executor.submit(
+                    process_row,
+                    snapshot,
+                    groups,
+                    cache,
+                    timeout,
+                    delay,
+                    max_requests_per_row,
+                ): snapshot
                 for snapshot in snapshots
             }
             for future in as_completed(future_to_snapshot):
@@ -600,6 +789,7 @@ def generate_review(
 
                 apply_row_result(ws, result, summary_col)
                 completed += 1
+                completed_rows.add(snapshot.row)
                 print(
                     f"Completed {completed}/{len(snapshots)}: "
                     f"row {snapshot.row} {snapshot.district} "
@@ -609,10 +799,12 @@ def generate_review(
 
                 if completed % cache_save_interval == 0:
                     cache.save_if_dirty()
+                    save_progress_atomic(progress_path, completed_rows, len(snapshots))
                 if completed % workbook_save_interval == 0:
                     save_workbook_atomic(wb, output_path)
     finally:
         cache.save_if_dirty()
+        save_progress_atomic(progress_path, completed_rows, len(snapshots))
         save_workbook_atomic(wb, output_path)
 
 
@@ -621,6 +813,7 @@ def main() -> None:
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--cache", type=Path, default=DEFAULT_CACHE)
+    parser.add_argument("--progress", type=Path, default=DEFAULT_PROGRESS)
     parser.add_argument("--start-row", type=int, default=START_ROW)
     parser.add_argument("--end-row", type=int, default=END_ROW)
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
@@ -628,6 +821,7 @@ def main() -> None:
     parser.add_argument("--workbook-save-interval", type=int, default=DEFAULT_WORKBOOK_SAVE_INTERVAL)
     parser.add_argument("--timeout", type=int, default=TIMEOUT_SECONDS)
     parser.add_argument("--delay", type=float, default=REQUEST_DELAY_SECONDS)
+    parser.add_argument("--max-requests-per-row", type=int, default=DEFAULT_MAX_REQUESTS_PER_ROW)
     args = parser.parse_args()
 
     generate_review(
@@ -641,6 +835,8 @@ def main() -> None:
         workbook_save_interval=args.workbook_save_interval,
         timeout=args.timeout,
         delay=args.delay,
+        progress_path=args.progress,
+        max_requests_per_row=args.max_requests_per_row,
     )
     print(f"Review workbook written to: {args.output.resolve()}", flush=True)
 
