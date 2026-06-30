@@ -1,79 +1,115 @@
 """
-simbli.py — Playwright-based scraper for Simbli
+simbli.py - undetected-chromedriver based scraper for Simbli
 """
-
 import asyncio
 import re
 import random
-from urllib.parse import urlencode
+import time
+from bs4 import BeautifulSoup
+import undetected_chromedriver as uc
+from urllib.parse import urljoin
+
 from models import DistrictRecord, PolicyEntry, ScrapeResult, ScapeAction, HighlightColor
 
 # The base URL for searching policies on a specific board
 SIMBLI_SEARCH_URL = "https://simbli.eboardsolutions.com/Policy/PolicyListing.aspx?S={simbli_id}"
 
-async def _get_policy_listing(page, simbli_id: str):
+_CACHE = {}
+
+def _get_policy_listing_sync(driver: uc.Chrome, simbli_id: str):
     """
-    Navigates to the policy listing page and extracts all rows.
-    Returns a list of dicts: {"code": "BP 3510", "title": "...", "revised": "2019", "link": "..."}
+    Fetches the policy listing page and extracts all rows using BeautifulSoup.
+    Uses caching to avoid fetching the same district's page multiple times.
     """
-    url = SIMBLI_SEARCH_URL.format(simbli_id=simbli_id)
-    await page.goto(url, wait_until="domcontentloaded")
-    
-    # Wait for the table to appear, or timeout if empty/blocked
-    try:
-        await page.wait_for_selector("table.PolicyList", timeout=10000)
-    except Exception:
-        # Check if we got Cloudflare blocked
-        title = await page.title()
-        if "Just a moment" in title or "Cloudflare" in title:
-            raise PermissionError("Cloudflare blocked")
-        return [] # No table found, empty policies
+    if simbli_id in _CACHE:
+        return _CACHE[simbli_id]
         
-    # Extract data from the table rows
-    # Note: Simbli DOM structure needs to be verified during pilot. 
-    # Assuming standard table with rows where first col is Code, second is Title, etc.
-    # We will use evaluate to extract text.
+    url = SIMBLI_SEARCH_URL.format(simbli_id=simbli_id)
+    print(f"      [Simbli] Navigating to {url}")
+    driver.get(url)
     
-    rows_data = await page.evaluate('''() => {
-        const rows = document.querySelectorAll("table.PolicyList tr");
-        const data = [];
-        for (let i = 1; i < rows.length; i++) { // skip header
-            const cols = rows[i].querySelectorAll("td");
-            if (cols.length >= 3) {
-                const codeNode = cols[0];
-                const titleNode = cols[1];
-                const revNode = cols[cols.length - 1]; // Assume last col is Adopted/Revised date
-                
-                const aTag = codeNode.querySelector("a");
-                const link = aTag ? aTag.href : null;
-                
-                data.push({
-                    code: codeNode.innerText.trim(),
-                    title: titleNode.innerText.trim(),
-                    date_text: revNode.innerText.trim(),
-                    link: link
-                });
-            }
-        }
-        return data;
-    }''')
+    # Wait for Cloudflare
+    for _ in range(15):
+        if "Just a moment" in driver.title or "cf-browser-verification" in driver.page_source:
+            time.sleep(1)
+        else:
+            break
+            
+    time.sleep(3) # Give Angular a moment to render the grid
     
+    html = driver.page_source
+    soup = BeautifulSoup(html, 'html.parser')
+    
+    rows_data = []
+    
+    # 1. Check old PolicyList table first just in case some districts use older format
+    table = soup.select_one("table.PolicyList")
+    if table:
+        for row in table.select("tr")[1:]:
+            cols = row.select("td")
+            if len(cols) >= 3:
+                code_node = cols[0]
+                title_node = cols[1]
+                rev_node = cols[-1]
+                
+                a_tag = code_node.select_one("a")
+                link = a_tag['href'] if a_tag and a_tag.has_attr('href') else None
+                if link:
+                    link = urljoin("https://simbli.eboardsolutions.com/Policy/", link)
+                        
+                rows_data.append({
+                    'code': code_node.get_text(strip=True),
+                    'title': title_node.get_text(strip=True),
+                    'date_text': rev_node.get_text(strip=True),
+                    'link': link
+                })
+        _CACHE[simbli_id] = rows_data
+        return rows_data
+        
+    # 2. Check new policyFormat table
+    table = soup.select_one("table.policyFormat, div.pl-grid-wrap table")
+    if not table:
+        _CACHE[simbli_id] = []
+        return []
+        
+    for row in table.select("tr"):
+        cols = row.select("td")
+        if len(cols) >= 5:
+            # 0: Code, 1: Title+Link, 2: Type, 3: Revised, 4: Reviewed
+            code_text = cols[0].get_text(strip=True)
+            type_text = cols[2].get_text(strip=True)
+            
+            # Combine code and type for easy matching (e.g. '0000' + 'BP' = 'BP 0000')
+            full_code = f"{type_text} {code_text}".strip()
+            
+            title_node = cols[1]
+            title_text = title_node.get_text(strip=True)
+            
+            a_tag = title_node.select_one("a")
+            link = a_tag['href'] if a_tag and a_tag.has_attr('href') else None
+            if link:
+                link = urljoin("https://simbli.eboardsolutions.com/", link)
+                
+            rev_node = cols[3]
+            date_text = rev_node.get_text(strip=True)
+            
+            rows_data.append({
+                'code': full_code,
+                'title': title_text,
+                'date_text': date_text,
+                'link': link
+            })
+            
+    _CACHE[simbli_id] = rows_data
     return rows_data
 
 def _find_matching_policy(rows_data, target_code: str):
-    """
-    Tries to find the policy in the extracted rows.
-    target_code is e.g. "BP 3510" or "AR 3514.1".
-    """
-    # Clean target
     clean_target = target_code.replace(" ", "").lower()
-    
     for r in rows_data:
         clean_code = r['code'].replace(" ", "").lower()
         if clean_code == clean_target or clean_code.endswith(clean_target):
             return r
             
-    # Sometimes codes are missing prefixes like BP or AR in the listing
     if " " in target_code:
         prefix, num = target_code.split(" ", 1)
         clean_num = num.replace(" ", "").lower()
@@ -81,43 +117,29 @@ def _find_matching_policy(rows_data, target_code: str):
             clean_code = r['code'].replace(" ", "").lower()
             if clean_num == clean_code:
                 return r
-                
     return None
 
 def _extract_year(date_text: str) -> str | None:
-    """Extracts a 4-digit year from a date string like '10/24/2019'."""
     m = re.search(r'\b(19|20)\d{2}\b', date_text)
     return m.group(0) if m else None
 
-async def check_policy(district: DistrictRecord, policy: PolicyEntry, page, delay_min: int, delay_max: int) -> ScrapeResult:
-    """
-    Checks if an existing policy has been revised.
-    """
+def _check_policy_sync(district: DistrictRecord, policy: PolicyEntry, driver: uc.Chrome) -> ScrapeResult:
     result = ScrapeResult(
-        cds_code=district.cds_code,
-        district_name=district.district_name,
-        policy_code=policy.policy_code,
-        action=ScapeAction.UNCHANGED,
-        highlight_color=HighlightColor.NONE,
-        old_value=policy.value,
-        old_year_revised=policy.year_revised,
-        old_link=policy.link,
-        col_start=policy.col_start
+        cds_code=district.cds_code, district_name=district.district_name,
+        policy_code=policy.policy_code, action=ScapeAction.UNCHANGED,
+        highlight_color=HighlightColor.NONE, old_value=policy.value,
+        old_year_revised=policy.year_revised, old_link=policy.link, col_start=policy.col_start
     )
-    
     if not district.simbli_id:
         result.action = ScapeAction.SKIPPED
         result.notes = "No simbli_id found"
         return result
         
-    await asyncio.sleep(random.uniform(delay_min, delay_max))
-    
     try:
-        rows = await _get_policy_listing(page, district.simbli_id)
+        rows = _get_policy_listing_sync(driver, district.simbli_id)
         match = _find_matching_policy(rows, policy.policy_code)
         
         if not match:
-            # Policy is missing now? Link might be dead
             result.action = ScapeAction.LINK_DEAD
             result.highlight_color = HighlightColor.RED
             result.notes = "Policy not found in listing"
@@ -125,7 +147,6 @@ async def check_policy(district: DistrictRecord, policy: PolicyEntry, page, dela
             
         found_year = _extract_year(match['date_text'])
         new_link = match['link']
-        
         baseline_year = policy.max_year
         
         if found_year and baseline_year:
@@ -136,50 +157,32 @@ async def check_policy(district: DistrictRecord, policy: PolicyEntry, page, dela
                 if new_link and new_link != result.old_link:
                     result.new_link = new_link
                 result.notes = f"Revised: {baseline_year} -> {found_year}"
-            else:
-                # Same or older year
-                pass 
         else:
             result.notes = "Could not parse years for comparison"
             
-    except PermissionError:
-        result.action = ScapeAction.BOT_DETECTED
-        result.notes = "Cloudflare blocked"
     except Exception as exc:
         result.action = ScapeAction.ERROR
         result.notes = str(exc)
         
     return result
 
-async def search_for_policy(district: DistrictRecord, policy: PolicyEntry, page, delay_min: int, delay_max: int) -> ScrapeResult:
-    """
-    Searches for a policy that is currently marked 0/N/A to see if it was newly adopted.
-    """
+def _search_for_policy_sync(district: DistrictRecord, policy: PolicyEntry, driver: uc.Chrome) -> ScrapeResult:
     result = ScrapeResult(
-        cds_code=district.cds_code,
-        district_name=district.district_name,
-        policy_code=policy.policy_code,
-        action=ScapeAction.UNCHANGED,
-        highlight_color=HighlightColor.NONE,
-        old_value=policy.value,
-        old_year_revised=policy.year_revised,
-        old_link=policy.link,
-        col_start=policy.col_start
+        cds_code=district.cds_code, district_name=district.district_name,
+        policy_code=policy.policy_code, action=ScapeAction.UNCHANGED,
+        highlight_color=HighlightColor.NONE, old_value=policy.value,
+        old_year_revised=policy.year_revised, old_link=policy.link, col_start=policy.col_start
     )
-    
     if not district.simbli_id:
         result.action = ScapeAction.SKIPPED
         result.notes = "No simbli_id found"
         return result
         
-    await asyncio.sleep(random.uniform(delay_min, delay_max))
-    
     try:
-        rows = await _get_policy_listing(page, district.simbli_id)
+        rows = _get_policy_listing_sync(driver, district.simbli_id)
         match = _find_matching_policy(rows, policy.policy_code)
         
         if match:
-            # We found a policy that was previously 0/N/A!
             found_year = _extract_year(match['date_text'])
             new_link = match['link']
             
@@ -192,11 +195,20 @@ async def search_for_policy(district: DistrictRecord, policy: PolicyEntry, page,
                 result.new_link = new_link
             result.notes = f"Newly found! Year: {found_year}"
             
-    except PermissionError:
-        result.action = ScapeAction.BOT_DETECTED
-        result.notes = "Cloudflare blocked"
     except Exception as exc:
         result.action = ScapeAction.ERROR
         result.notes = str(exc)
         
     return result
+
+async def check_policy(district: DistrictRecord, policy: PolicyEntry, ctx, delay_min: int, delay_max: int) -> ScrapeResult:
+    driver, lock = ctx
+    async with lock:
+        await asyncio.sleep(random.uniform(delay_min, delay_max))
+        return await asyncio.to_thread(_check_policy_sync, district, policy, driver)
+
+async def search_for_policy(district: DistrictRecord, policy: PolicyEntry, ctx, delay_min: int, delay_max: int) -> ScrapeResult:
+    driver, lock = ctx
+    async with lock:
+        await asyncio.sleep(random.uniform(delay_min, delay_max))
+        return await asyncio.to_thread(_search_for_policy_sync, district, policy, driver)
