@@ -97,6 +97,7 @@ async def main_async(args):
     print("Initializing browser for Simbli...")
     options = uc.ChromeOptions()
     driver = uc.Chrome(options=options, version_main=149)
+    driver.set_page_load_timeout(30)
     simbli_lock = asyncio.Lock()
     simbli_ctx = (driver, simbli_lock)
     
