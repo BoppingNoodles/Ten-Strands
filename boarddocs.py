@@ -43,7 +43,7 @@ def _extract_year(date_text: str) -> str | None:
     m = re.search(r'\b(19|20)\d{2}\b', str(date_text))
     return m.group(0) if m else None
 
-async def check_policy(district: DistrictRecord, policy: PolicyEntry, page, delay_min: int, delay_max: int) -> ScrapeResult:
+async def check_policy(district: DistrictRecord, policy: PolicyEntry, session, delay_min: int, delay_max: int) -> ScrapeResult:
     """Check a BoardDocs policy."""
     result = ScrapeResult(
         cds_code=district.cds_code,
@@ -95,7 +95,7 @@ async def check_policy(district: DistrictRecord, policy: PolicyEntry, page, dela
             
     return result
 
-async def search_for_policy(district: DistrictRecord, policy: PolicyEntry, page, delay_min: int, delay_max: int) -> ScrapeResult:
+async def search_for_policy(district: DistrictRecord, policy: PolicyEntry, session, delay_min: int, delay_max: int) -> ScrapeResult:
     """Search for a 0/N/A policy in BoardDocs."""
     result = ScrapeResult(
         cds_code=district.cds_code,
