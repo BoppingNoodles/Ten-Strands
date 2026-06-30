@@ -5,7 +5,7 @@ scrape_policies.py — Orchestrator for the async scraping process.
 import asyncio
 import argparse
 from datetime import datetime
-from playwright.async_api import async_playwright
+from curl_cffi.requests import AsyncSession
 
 import reader
 import writer
@@ -14,16 +14,12 @@ import boarddocs
 import generic
 from models import ScrapeResult, ScapeAction, HighlightColor
 
-async def scrape_district(district, browser, sem, delay_min, delay_max):
+async def scrape_district(district, session, simbli_ctx, sem, delay_min, delay_max):
     """Process all policies for a single district."""
     results = []
     
-    # We are receiving a BrowserContext directly from launch_persistent_context
-    context = browser
-    
     async with sem:
         print(f"[{district.district_name}] Starting policy processing...")
-        page = await context.new_page()
         try:
             for i, policy in enumerate(district.policies):
                 print(f"[{district.district_name}] Checking policy {i+1}/{len(district.policies)}: {policy.policy_code} (System: Simbli={policy.is_simbli}, BoardDocs={policy.is_boarddocs})")
@@ -43,9 +39,9 @@ async def scrape_district(district, browser, sem, delay_min, delay_max):
                 if policy.is_adopted:
                     # Check for revisions
                     if policy.is_simbli or (policy.has_real_link == False and district.simbli_id):
-                        res = await simbli.check_policy(district, policy, page, delay_min, delay_max)
+                        res = await simbli.check_policy(district, policy, simbli_ctx, delay_min, delay_max)
                     elif policy.is_boarddocs or (policy.has_real_link == False and district.boarddocs_slug):
-                        res = await boarddocs.check_policy(district, policy, page, delay_min, delay_max)
+                        res = await boarddocs.check_policy(district, policy, session, delay_min, delay_max)
                     elif policy.has_real_link:
                         res = await generic.check_link(district, policy)
                     else:
@@ -60,9 +56,9 @@ async def scrape_district(district, browser, sem, delay_min, delay_max):
                 elif policy.is_not_adopted:
                     # Check if newly adopted
                     if district.simbli_id:
-                        res = await simbli.search_for_policy(district, policy, page, delay_min, delay_max)
+                        res = await simbli.search_for_policy(district, policy, simbli_ctx, delay_min, delay_max)
                     elif district.boarddocs_slug:
-                        res = await boarddocs.search_for_policy(district, policy, page, delay_min, delay_max)
+                        res = await boarddocs.search_for_policy(district, policy, session, delay_min, delay_max)
                     else:
                         res = ScrapeResult(
                             cds_code=district.cds_code, district_name=district.district_name,
@@ -71,8 +67,8 @@ async def scrape_district(district, browser, sem, delay_min, delay_max):
                             col_start=policy.col_start
                         )
                     results.append(res)
-        finally:
-            await page.close()
+        except Exception as e:
+            print(f"[{district.district_name}] Error: {e}")
             
     return results
 
@@ -93,26 +89,28 @@ async def main_async(args):
             
     print(f"Found {len(districts)} districts. Skipped {skipped_districts} (no DB/links). Proceeding with {len(valid_districts)}.")
     
-    sem = asyncio.Semaphore(args.concurrency)
+    # Increase concurrency since HTTP requests are lightweight compared to Playwright tabs
+    # but don't increase too much to avoid rate limits.
+    sem = asyncio.Semaphore(args.concurrency * 2) 
     
-    async with async_playwright() as pw:
-        # Use a persistent context to help avoid bot detection
-        browser = await pw.chromium.launch_persistent_context(
-            user_data_dir="./playwright_user_data",
-            headless=args.headless,
-            channel="chrome" if not args.headless else None # Use stock chrome if headed
-        )
-        
+    import undetected_chromedriver as uc
+    print("Initializing browser for Simbli...")
+    options = uc.ChromeOptions()
+    driver = uc.Chrome(options=options, version_main=149)
+    simbli_lock = asyncio.Lock()
+    simbli_ctx = (driver, simbli_lock)
+    
+    async with AsyncSession(impersonate='chrome110') as session:
         tasks = [
-            scrape_district(d, browser, sem, args.delay_min, args.delay_max) 
+            scrape_district(d, session, simbli_ctx, sem, args.delay_min, args.delay_max) 
             for d in valid_districts
         ]
         
         print("Starting scrape...")
-        # Use asyncio.gather
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
-        await browser.close()
+    print("Closing browser...")
+    driver.quit()
         
     print(f"Scrape complete. Writing output to {args.output} and log to {args.log}...")
     writer.write_output(args.input, results, args.output, args.sheet)
@@ -125,10 +123,9 @@ def main():
     parser.add_argument("--sheet", default="Caden")
     parser.add_argument("--pilot", action="store_true", help="Run only first 5 districts")
     parser.add_argument("--limit", type=int, default=None, help="Process max N districts")
-    parser.add_argument("--concurrency", type=int, default=2, help="Max parallel browsers")
-    parser.add_argument("--delay-min", type=int, default=2)
-    parser.add_argument("--delay-max", type=int, default=5)
-    parser.add_argument("--headless", action="store_true", help="Run Playwright headless")
+    parser.add_argument("--concurrency", type=int, default=5, help="Max parallel districts")
+    parser.add_argument("--delay-min", type=int, default=1)
+    parser.add_argument("--delay-max", type=int, default=3)
     
     args = parser.parse_args()
     
