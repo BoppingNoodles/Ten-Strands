@@ -6,11 +6,12 @@ import openpyxl
 from openpyxl.styles import PatternFill
 import json
 from datetime import datetime
-from models import ScrapeResult, HighlightColor
+from models import ScrapeResult, HighlightColor, is_safe_routes_policy_code
 
 # Highlight Colors
 GREEN_FILL = PatternFill(start_color="00B050", end_color="00B050", fill_type="solid")
 RED_FILL = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
+NO_FILL = PatternFill(fill_type=None)
 
 def write_output(input_path: str, results: list[list[ScrapeResult]], output_path: str, sheet_name: str):
     """
@@ -46,14 +47,24 @@ def write_output(input_path: str, results: list[list[ScrapeResult]], output_path
         district_updated = False
         
         for res in district_results:
+            safe_routes = is_safe_routes_policy_code(res.policy_code)
+
             # Update cells if there are changes
             if res.new_value is not None:
                 ws.cell(row=row_idx, column=res.col_start).value = res.new_value
+            if res.new_year_adopted is not None:
+                ws.cell(row=row_idx, column=res.col_start + 1).value = res.new_year_adopted
             if res.new_year_revised is not None:
                 ws.cell(row=row_idx, column=res.col_start + 2).value = res.new_year_revised
             if res.new_link is not None:
                 ws.cell(row=row_idx, column=res.col_start + 3).value = res.new_link
-                
+
+            if safe_routes:
+                # Safe Routes updates are written but never highlighted or tracked.
+                for offset in range(4):
+                    ws.cell(row=row_idx, column=res.col_start + offset).fill = NO_FILL
+                continue
+
             # Apply highlighting to the VALUE cell (col_start)
             if res.highlight_color == HighlightColor.GREEN:
                 ws.cell(row=row_idx, column=res.col_start).fill = GREEN_FILL
@@ -61,7 +72,7 @@ def write_output(input_path: str, results: list[list[ScrapeResult]], output_path
             elif res.highlight_color == HighlightColor.RED:
                 ws.cell(row=row_idx, column=res.col_start).fill = RED_FILL
                 district_updated = True
-            elif res.new_value or res.new_link or res.new_year_revised:
+            elif res.new_value or res.new_year_adopted or res.new_link or res.new_year_revised:
                 # Even if no specific color requested, a change means district was updated
                 district_updated = True
                 

@@ -19,7 +19,7 @@ def _parse_boarddocs_slug(url: Optional[str]) -> Optional[str]:
     m = re.search(r"boarddocs\.com/\w+/([^/]+)/", url)
     return m.group(1) if m else None
 
-def load_districts(filepath: str, sheet_name: str, limit: Optional[int] = None) -> list[DistrictRecord]:
+def load_districts(filepath: str, sheet_name: str, limit: Optional[int] = None, start_row: Optional[int] = None, end_row: Optional[int] = None) -> list[DistrictRecord]:
     """
     Load districts from the specified Excel file and sheet.
     Rows 1-2 are headers. Data starts at row 3.
@@ -33,7 +33,12 @@ def load_districts(filepath: str, sheet_name: str, limit: Optional[int] = None) 
     
     # Iterate over data rows
     for row_idx, row_tuple in enumerate(ws.iter_rows(min_row=3, values_only=True), start=3):
-        # Stop at empty rows or if limit reached
+        if start_row and row_idx < start_row:
+            continue
+        if end_row and row_idx > end_row:
+            break
+            
+        # Stop at empty rows
         cds_code = str(row_tuple[1]).strip() if row_tuple[1] is not None else ""
         if not cds_code or cds_code == "None":
             continue

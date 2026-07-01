@@ -53,6 +53,13 @@ POLICY_DEFS: list[dict] = [
 # Sentinels that mean "no policy / no database"
 NO_DATA_SENTINELS = {"N/A", "*", None, ""}
 
+SAFE_ROUTES_CODES = frozenset({"BP 5142.2", "AR 5142.2"})
+SAFE_ROUTES_COL_STARTS = (25, 53)
+
+
+def is_safe_routes_policy_code(policy_code: str) -> bool:
+    return policy_code in SAFE_ROUTES_CODES
+
 
 @dataclass
 class PolicyEntry:
@@ -77,9 +84,9 @@ class PolicyEntry:
 
     @property
     def is_not_adopted(self) -> bool:
-        """True if policy is not adopted (0 or N/A)."""
+        """True if policy is not adopted (0, N/A, or blank)."""
         v = str(self.value).strip()
-        return v in {"0", "0.0", "N/A"}
+        return v in {"0", "0.0", "N/A", "None", ""}
 
     @property
     def has_real_link(self) -> bool:
@@ -98,6 +105,19 @@ class PolicyEntry:
     @property
     def is_boarddocs(self) -> bool:
         return self.has_real_link and "boarddocs.com" in str(self.link).lower()
+
+    @property
+    def is_blank_block(self) -> bool:
+        """True if all four policy cells (value/adopted/revised/link) are empty."""
+        return all(
+            value is None or str(value).strip() == ""
+            for value in (self.value, self.year_adopted, self.year_revised, self.link)
+        )
+
+    @property
+    def has_year_data(self) -> bool:
+        """True if adopted or revised contains a parseable year."""
+        return self.max_year is not None
 
     @property
     def max_year(self) -> Optional[int]:
@@ -143,11 +163,16 @@ class ScrapeResult:
 
     # New values (from scrape) — None means "no change"
     new_value: Optional[str] = None
+    new_year_adopted: Optional[str] = None
     new_year_revised: Optional[str] = None
     new_link: Optional[str] = None
 
     # Source column info (for writer)
     col_start: int = 0
+
+    def append_note(self, note: str) -> None:
+        if note:
+            self.notes = f"{self.notes}; {note}" if self.notes else note
 
     def to_dict(self) -> dict:
         return {
@@ -161,7 +186,86 @@ class ScrapeResult:
             "old_year_revised":self.old_year_revised,
             "old_link":       self.old_link,
             "new_value":      self.new_value,
+            "new_year_adopted":self.new_year_adopted,
             "new_year_revised":self.new_year_revised,
             "new_link":       self.new_link,
             "col_start":      self.col_start,
         }
+
+
+def blank_not_found_result(
+    district: DistrictRecord,
+    policy: PolicyEntry,
+    notes: str,
+) -> ScrapeResult:
+    """Normalize a blank policy block to 0 / N/A / N/A / N/A."""
+    return ScrapeResult(
+        cds_code=district.cds_code,
+        district_name=district.district_name,
+        policy_code=policy.policy_code,
+        action=ScapeAction.UNCHANGED,
+        highlight_color=HighlightColor.NONE,
+        notes=notes,
+        old_value=policy.value,
+        old_year_revised=policy.year_revised,
+        old_link=policy.link,
+        new_value="0",
+        new_year_adopted="N/A",
+        new_year_revised="N/A",
+        new_link="N/A",
+        col_start=policy.col_start,
+    )
+
+
+def apply_policy_link(
+    result: ScrapeResult,
+    policy: PolicyEntry,
+    new_link: Optional[str],
+    via: str = "index",
+) -> None:
+    """
+    Update result.new_link when spreadsheet year data implies a real URL,
+    or clear invalid placeholder links when no URL can be resolved.
+    """
+    if policy.has_real_link:
+        if policy.has_year_data and new_link and str(policy.link).strip() != new_link:
+            result.new_link = new_link
+            result.append_note(f"Link updated (via {via})")
+        return
+
+    link_text = str(policy.link).strip() if policy.link is not None else ""
+    if not link_text or link_text in {"N/A", "*"}:
+        return
+
+    if policy.has_year_data and new_link:
+        result.new_link = new_link
+        result.append_note(f"Link updated (via {via})")
+        return
+
+    result.new_link = "N/A"
+    if policy.has_year_data:
+        result.append_note("Invalid link replaced with N/A; no URL found")
+    else:
+        result.append_note("Invalid link cleared; no year data")
+
+
+def is_bad_link(value: Optional[str]) -> bool:
+    """True if link cell is non-empty but not a real URL or allowed sentinel."""
+    if value is None or str(value).strip() == "":
+        return False
+    text = str(value).strip()
+    if text in {"N/A", "*"}:
+        return False
+    return not text.startswith(("http://", "https://"))
+
+
+def has_year_data(adopted: Optional[str], revised: Optional[str]) -> bool:
+    for year in (adopted, revised):
+        try:
+            val = int(str(year).strip())
+            if 1900 < val < 2100:
+                return True
+        except (ValueError, TypeError):
+            pass
+    return False
+

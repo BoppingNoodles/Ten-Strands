@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.xlsx
+~$*.xlsx
+scrape_log_*.json
+playwright_user_data/
+debug_*.html
+emery_page.html
+simbli_test.html
+simbli_text.txt

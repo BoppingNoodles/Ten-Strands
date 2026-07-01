@@ -1,0 +1,5 @@
+openpyxl
+beautifulsoup4
+httpx
+curl_cffi
+undetected-chromedriver

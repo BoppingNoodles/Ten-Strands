@@ -12,7 +12,24 @@ import writer
 import simbli
 import boarddocs
 import generic
-from models import ScrapeResult, ScapeAction, HighlightColor
+import discover
+from models import ScrapeResult, ScapeAction, HighlightColor, blank_not_found_result, is_safe_routes_policy_code
+
+
+def _is_safe_routes_policy(policy) -> bool:
+    return is_safe_routes_policy_code(policy.policy_code)
+
+
+def _safe_routes_not_found_result(district, policy, notes):
+    return _not_found_result(district, policy, notes)
+
+
+def _is_blank_policy_block(policy) -> bool:
+    return policy.is_blank_block
+
+
+def _not_found_result(district, policy, notes):
+    return blank_not_found_result(district, policy, notes)
 
 async def scrape_district(district, session, simbli_ctx, sem, delay_min, delay_max):
     """Process all policies for a single district."""
@@ -60,12 +77,17 @@ async def scrape_district(district, session, simbli_ctx, sem, delay_min, delay_m
                     elif district.boarddocs_slug:
                         res = await boarddocs.search_for_policy(district, policy, session, delay_min, delay_max)
                     else:
-                        res = ScrapeResult(
-                            cds_code=district.cds_code, district_name=district.district_name,
-                            policy_code=policy.policy_code, action=ScapeAction.SKIPPED,
-                            highlight_color=HighlightColor.NONE, notes="No system ID to search",
-                            col_start=policy.col_start
-                        )
+                        if _is_blank_policy_block(policy):
+                            res = _not_found_result(
+                                district, policy, "No system ID to search; normalized blank policy cells to 0/N/A"
+                            )
+                        else:
+                            res = ScrapeResult(
+                                cds_code=district.cds_code, district_name=district.district_name,
+                                policy_code=policy.policy_code, action=ScapeAction.SKIPPED,
+                                highlight_color=HighlightColor.NONE, notes="No system ID to search",
+                                col_start=policy.col_start
+                            )
                     results.append(res)
         except Exception as e:
             print(f"[{district.district_name}] Error: {e}")
@@ -74,25 +96,18 @@ async def scrape_district(district, session, simbli_ctx, sem, delay_min, delay_m
 
 async def main_async(args):
     print(f"Loading data from '{args.input}' sheet '{args.sheet}'...")
-    districts = reader.load_districts(args.input, args.sheet, limit=args.limit)
+    districts = reader.load_districts(
+        args.input, 
+        args.sheet, 
+        limit=args.limit,
+        start_row=args.start_row,
+        end_row=args.end_row
+    )
     
-    # Filter out districts that are completely * / N/A with no links
-    valid_districts = []
-    skipped_districts = 0
-    for d in districts:
-        has_system = bool(d.simbli_id or d.boarddocs_slug)
-        has_any_link = any(p.has_real_link for p in d.policies)
-        if not has_system and not has_any_link:
-            skipped_districts += 1
-        else:
-            valid_districts.append(d)
-            
-    print(f"Found {len(districts)} districts. Skipped {skipped_districts} (no DB/links). Proceeding with {len(valid_districts)}.")
-    
-    # Increase concurrency since HTTP requests are lightweight compared to Playwright tabs
-    # but don't increase too much to avoid rate limits.
-    sem = asyncio.Semaphore(args.concurrency * 2) 
-    
+    # Phase 2: For districts with no system ID and no links, try Google search
+    # (via real Chrome browser to bypass anti-bot) to discover their Simbli or
+    # BoardDocs platform. Must happen after the browser is initialized.
+
     import undetected_chromedriver as uc
     print("Initializing browser for Simbli...")
     options = uc.ChromeOptions()
@@ -100,6 +115,14 @@ async def main_async(args):
     driver.set_page_load_timeout(30)
     simbli_lock = asyncio.Lock()
     simbli_ctx = (driver, simbli_lock)
+
+    await discover.discover_missing_platforms(districts, simbli_ctx)
+    
+    valid_districts = districts
+    print(f"Found {len(districts)} districts. Proceeding with {len(valid_districts)}.")
+    
+    # Increase concurrency
+    sem = asyncio.Semaphore(args.concurrency * 2)
     
     async with AsyncSession(impersonate='chrome110') as session:
         tasks = [
@@ -124,6 +147,8 @@ def main():
     parser.add_argument("--sheet", default="Caden")
     parser.add_argument("--pilot", action="store_true", help="Run only first 5 districts")
     parser.add_argument("--limit", type=int, default=None, help="Process max N districts")
+    parser.add_argument("--start-row", type=int, default=None, help="Start at row number (inclusive)")
+    parser.add_argument("--end-row", type=int, default=None, help="End at row number (inclusive)")
     parser.add_argument("--concurrency", type=int, default=5, help="Max parallel districts")
     parser.add_argument("--delay-min", type=int, default=1)
     parser.add_argument("--delay-max", type=int, default=3)

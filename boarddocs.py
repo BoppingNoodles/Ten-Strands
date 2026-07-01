@@ -4,7 +4,15 @@ boarddocs.py — API-based scraper for BoardDocs
 
 import httpx
 import re
-from models import DistrictRecord, PolicyEntry, ScrapeResult, ScapeAction, HighlightColor
+from models import (
+    DistrictRecord,
+    PolicyEntry,
+    ScrapeResult,
+    ScapeAction,
+    HighlightColor,
+    apply_policy_link,
+    blank_not_found_result,
+)
 
 # BoardDocs has a public JSON API for boards
 BOARDDOCS_API_URL = "https://go.boarddocs.com/ca/{slug}/Board.nsf/policies?open&format=json"
@@ -29,14 +37,59 @@ async def _fetch_policies_api(slug: str) -> list[dict]:
         pass
     return []
 
+def _normalize_policy_code(value: str) -> str:
+    return re.sub(r"[^a-z0-9.]", "", str(value).lower())
+
+
+def _policy_number(value: str) -> str:
+    match = re.search(r"\d+(?:\.\d+)+", str(value))
+    return match.group(0) if match else ""
+
+
+def _is_safe_routes_target(target_code: str) -> bool:
+    return _policy_number(target_code) == "5142.2"
+
+
+def _safe_routes_not_found_result(result: ScrapeResult) -> ScrapeResult:
+    result.action = ScapeAction.UNCHANGED
+    result.highlight_color = HighlightColor.NONE
+    result.new_value = "0"
+    result.new_year_adopted = "N/A"
+    result.new_year_revised = "N/A"
+    result.new_link = "N/A"
+    result.notes = "Safe Routes policy not found; normalized blank cells to 0/N/A"
+    return result
+
+
+def _safe_routes_match(policy: dict, target_code: str) -> bool:
+    code = str(policy.get("code", "") or "")
+    name = str(policy.get("name", "") or policy.get("title", "") or "")
+    target_type = target_code.split()[0].lower() if " " in target_code else ""
+    row_type = code.split()[0].lower() if " " in code else ""
+    type_matches = not target_type or not row_type or target_type == row_type
+    number_matches = _policy_number(code) == "5142.2" or _policy_number(name) == "5142.2"
+    title_matches = "safe routes" in name.lower() and "school" in name.lower()
+    return type_matches and (number_matches or title_matches)
+
+
 def _find_matching_policy(policies: list[dict], target_code: str):
-    clean_target = target_code.replace(" ", "").lower()
+    clean_target = _normalize_policy_code(target_code)
     for p in policies:
         code = p.get("code", "") or p.get("name", "")
-        clean_code = code.replace(" ", "").lower()
+        clean_code = _normalize_policy_code(code)
         if clean_target in clean_code:
             return p
+        if _is_safe_routes_target(target_code) and _safe_routes_match(p, target_code):
+            return p
     return None
+
+
+def _boarddocs_policy_link(district: DistrictRecord, match: dict) -> str | None:
+    pid = match.get("id")
+    if pid:
+        return f"https://go.boarddocs.com/ca/{district.boarddocs_slug}/Board.nsf/goto?open&id={pid}"
+    return None
+
 
 def _extract_year(date_text: str) -> str | None:
     if not date_text: return None
@@ -64,8 +117,10 @@ async def check_policy(district: DistrictRecord, policy: PolicyEntry, session, d
         
     policies = await _fetch_policies_api(district.boarddocs_slug)
     if not policies:
-        # Fallback to checking if the link is alive using generic HTTP check
-        # because the API might not be public or we have the wrong endpoint
+        apply_policy_link(result, policy, None, via="BoardDocs API")
+        if not policy.has_real_link:
+            result.notes = "BoardDocs API returned no data"
+            return result
         result.notes = "BoardDocs API returned no data, doing basic link check"
         import generic
         return await generic.check_link(district, policy)
@@ -77,22 +132,17 @@ async def check_policy(district: DistrictRecord, policy: PolicyEntry, session, d
         result.notes = "Policy not found in API"
         return result
         
-    # Check revision date
     rev_date = match.get("revised") or match.get("last_modified") or match.get("adopted")
     found_year = _extract_year(rev_date)
-    
+    apply_policy_link(result, policy, _boarddocs_policy_link(district, match), via="BoardDocs API")
+
     baseline_year = policy.max_year
     if found_year and baseline_year and int(found_year) > baseline_year:
         result.action = ScapeAction.REVISED
         result.highlight_color = HighlightColor.GREEN
         result.new_year_revised = found_year
         result.notes = f"Revised: {baseline_year} -> {found_year}"
-        
-        # Build direct link if we have the ID
-        pid = match.get("id")
-        if pid:
-            result.new_link = f"https://go.boarddocs.com/ca/{district.boarddocs_slug}/Board.nsf/goto?open&id={pid}"
-            
+
     return result
 
 async def search_for_policy(district: DistrictRecord, policy: PolicyEntry, session, delay_min: int, delay_max: int) -> ScrapeResult:
@@ -110,29 +160,45 @@ async def search_for_policy(district: DistrictRecord, policy: PolicyEntry, sessi
     )
     
     if not district.boarddocs_slug:
+        if _is_safe_routes_target(policy.policy_code):
+            return _safe_routes_not_found_result(result)
         result.action = ScapeAction.SKIPPED
         return result
         
     policies = await _fetch_policies_api(district.boarddocs_slug)
     if not policies:
+        if policy.is_blank_block:
+            return blank_not_found_result(
+                district,
+                policy,
+                "BoardDocs API empty; normalized blank cells to 0/N/A",
+            )
+        if _is_safe_routes_target(policy.policy_code):
+            return _safe_routes_not_found_result(result)
         result.notes = "API empty"
         return result
-        
+
     match = _find_matching_policy(policies, policy.policy_code)
     if match:
         rev_date = match.get("revised") or match.get("last_modified") or match.get("adopted")
         found_year = _extract_year(rev_date)
-        
+
         result.action = ScapeAction.NEWLY_FOUND
         result.highlight_color = HighlightColor.GREEN
         result.new_value = "1"
         if found_year:
+            result.new_year_adopted = found_year
             result.new_year_revised = found_year
-            
-        pid = match.get("id")
-        if pid:
-            result.new_link = f"https://go.boarddocs.com/ca/{district.boarddocs_slug}/Board.nsf/goto?open&id={pid}"
-            
+
+        apply_policy_link(result, policy, _boarddocs_policy_link(district, match), via="BoardDocs API")
         result.notes = f"Newly found! Year: {found_year}"
-        
+    elif policy.is_blank_block:
+        return blank_not_found_result(
+            district,
+            policy,
+            "Policy not found in BoardDocs; normalized blank cells to 0/N/A",
+        )
+    elif _is_safe_routes_target(policy.policy_code):
+        _safe_routes_not_found_result(result)
+
     return result
