@@ -72,8 +72,20 @@ def write_output(input_path: str, results: list[list[ScrapeResult]], output_path
             elif res.highlight_color == HighlightColor.RED:
                 ws.cell(row=row_idx, column=res.col_start).fill = RED_FILL
                 district_updated = True
-            elif res.new_value or res.new_year_adopted or res.new_link or res.new_year_revised:
-                # Even if no specific color requested, a change means district was updated
+            else:
+                ws.cell(row=row_idx, column=res.col_start).fill = NO_FILL
+
+            # Decide whether this result represents a real policy-status change
+            # worth flagging the district as "Policy Updated". By default that
+            # means an actionable highlight: revised/newly found (GREEN) or a
+            # dead link (RED). Other writes (link backfill, redirect, cosmetic
+            # blank normalization to 0/N/A) update the cells but are bookkeeping,
+            # not a policy update. A result may override this via tracking_change.
+            if res.tracking_change is True:
+                district_updated = True
+            elif res.tracking_change is False:
+                continue
+            elif res.highlight_color in (HighlightColor.GREEN, HighlightColor.RED):
                 district_updated = True
                 
         if district_updated:
