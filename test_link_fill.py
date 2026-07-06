@@ -85,13 +85,13 @@ async def test_three_districts_live(rows: list[int] | None = None) -> None:
     try:
         await discover.discover_missing_platforms(districts, simbli_ctx)
 
-        sem = asyncio.Semaphore(3)
         async with AsyncSession(impersonate="chrome110") as session:
-            tasks = [
-                scrape_district(d, session, simbli_ctx, sem, delay_min=2.5, delay_max=5.5)
-                for d in districts
-            ]
-            all_results = await asyncio.gather(*tasks, return_exceptions=True)
+            all_results = []
+            for d in districts:
+                district_results = await scrape_district(
+                    d, session, simbli_ctx, delay_min=2.5, delay_max=5.5
+                )
+                all_results.append(district_results)
 
         newly_found = []
         link_backfilled = []
