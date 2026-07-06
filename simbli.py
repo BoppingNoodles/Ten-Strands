@@ -32,14 +32,24 @@ SIMBLI_SEARCH_URL = "https://simbli.eboardsolutions.com/Policy/PolicyListing.asp
 # Cache keyed by simbli_id → list of row dicts from the policy index
 _INDEX_CACHE = {}
 
+# Pacing helpers — keep requests human-paced without making full runs too slow.
+_NAV_PAUSE_MIN = 0.8
+_NAV_PAUSE_MAX = 1.6
+_ACTION_PAUSE_MIN = 1.2
+_ACTION_PAUSE_MAX = 2.2
 
-def _wait_for_page(driver: uc.Chrome, extra_wait: float = 3.0):
+
+def _human_pause(min_s: float = _ACTION_PAUSE_MIN, max_s: float = _ACTION_PAUSE_MAX) -> None:
+    time.sleep(random.uniform(min_s, max_s))
+
+
+def _wait_for_page(driver: uc.Chrome, extra_wait: float = 4.0):
     """Wait for Cloudflare to pass and Angular to render."""
-    for _ in range(15):
+    for _ in range(20):
         title = driver.title
         src = driver.page_source
         if "Just a moment" in title or "cf-browser-verification" in src:
-            time.sleep(1)
+            time.sleep(1.5)
         else:
             break
     time.sleep(extra_wait)
@@ -49,6 +59,7 @@ def _navigate(driver: uc.Chrome, url: str) -> bool:
     """Navigate to url. Returns False on timeout/error."""
     try:
         driver.get(url)
+        _human_pause(_NAV_PAUSE_MIN, _NAV_PAUSE_MAX)
         return True
     except Exception as e:
         print(f"      [Simbli] Error loading {url}: {e}")
@@ -146,7 +157,7 @@ def _scrape_direct_link(driver: uc.Chrome, link: str) -> dict | None:
     if not ok:
         return None
 
-    _wait_for_page(driver, extra_wait=3.0)
+    _wait_for_page(driver, extra_wait=4.0)
 
     html = driver.page_source
     soup = BeautifulSoup(html, 'html.parser')
@@ -211,7 +222,7 @@ def _get_policy_listing_sync(driver: uc.Chrome, simbli_id: str) -> list:
         _INDEX_CACHE[simbli_id] = []
         return []
 
-    _wait_for_page(driver, extra_wait=3.0)
+    _wait_for_page(driver, extra_wait=4.0)
 
     html = driver.page_source
     soup = BeautifulSoup(html, 'html.parser')
@@ -419,6 +430,7 @@ def _check_policy_sync(district: DistrictRecord, policy: PolicyEntry, driver: uc
 
     # ── Step 2: Fall back to policy index scan ────────────────────────────────
     print(f"      [Simbli] Falling back to index scan for {policy.policy_code}")
+    _human_pause()
     try:
         rows = _get_policy_listing_sync(driver, district.simbli_id)
         match = _find_matching_policy(rows, policy.policy_code)

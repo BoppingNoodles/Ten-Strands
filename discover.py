@@ -102,7 +102,7 @@ async def discover_platform(district, driver, lock) -> tuple[str | None, str | N
         print(f"  [Discover] Rejected Simbli ID for '{name}' after title/name verification: S={simbli_id}")
 
     # If no Simbli found, search for BoardDocs
-    await asyncio.sleep(1.5)
+    await asyncio.sleep(2.5)
     async with lock:
         boarddocs_query = f'"{name}" boarddocs.com board policies'
         boarddocs_html = await loop.run_in_executor(
@@ -156,6 +156,6 @@ async def discover_missing_platforms(districts: list, simbli_ctx: tuple) -> None
             district.simbli_id = simbli_id
         elif boarddocs_slug:
             district.boarddocs_slug = boarddocs_slug
-        await asyncio.sleep(2)  # Polite pause between searches
+        await asyncio.sleep(3)  # Polite pause between searches
 
     print("[Discover] Platform discovery complete.\n")

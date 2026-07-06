@@ -120,9 +120,12 @@ async def main_async(args):
     
     valid_districts = districts
     print(f"Found {len(districts)} districts. Proceeding with {len(valid_districts)}.")
+    print(
+        f"Pacing: concurrency={args.concurrency}, "
+        f"delay={args.delay_min:.1f}-{args.delay_max:.1f}s between Simbli requests"
+    )
     
-    # Increase concurrency
-    sem = asyncio.Semaphore(args.concurrency * 2)
+    sem = asyncio.Semaphore(args.concurrency)
     
     async with AsyncSession(impersonate='chrome110') as session:
         tasks = [
@@ -149,9 +152,9 @@ def main():
     parser.add_argument("--limit", type=int, default=None, help="Process max N districts")
     parser.add_argument("--start-row", type=int, default=None, help="Start at row number (inclusive)")
     parser.add_argument("--end-row", type=int, default=None, help="End at row number (inclusive)")
-    parser.add_argument("--concurrency", type=int, default=5, help="Max parallel districts")
-    parser.add_argument("--delay-min", type=int, default=1)
-    parser.add_argument("--delay-max", type=int, default=3)
+    parser.add_argument("--concurrency", type=int, default=3, help="Max parallel districts")
+    parser.add_argument("--delay-min", type=float, default=2.5, help="Min seconds between Simbli requests")
+    parser.add_argument("--delay-max", type=float, default=5.5, help="Max seconds between Simbli requests")
     
     args = parser.parse_args()
     
