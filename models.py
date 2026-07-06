@@ -224,8 +224,8 @@ def apply_policy_link(
     via: str = "index",
 ) -> None:
     """
-    Update result.new_link when spreadsheet year data implies a real URL,
-    or clear invalid placeholder links when no URL can be resolved.
+    Update result.new_link when a scraped URL is available, or clear invalid
+    placeholder links when no URL can be resolved.
     """
     if policy.has_real_link:
         if policy.has_year_data and new_link and str(policy.link).strip() != new_link:
@@ -234,10 +234,15 @@ def apply_policy_link(
         return
 
     link_text = str(policy.link).strip() if policy.link is not None else ""
+    if (not link_text or link_text in {"N/A", "*"}) and new_link:
+        result.new_link = new_link
+        result.append_note(f"Link added (via {via})")
+        return
+
     if not link_text or link_text in {"N/A", "*"}:
         return
 
-    if policy.has_year_data and new_link:
+    if new_link:
         result.new_link = new_link
         result.append_note(f"Link updated (via {via})")
         return
