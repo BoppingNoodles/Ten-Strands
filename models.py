@@ -167,6 +167,11 @@ class ScrapeResult:
     new_year_revised: Optional[str] = None
     new_link: Optional[str] = None
 
+    # Whether this result represents a meaningful change worth flagging the
+    # district as "Policy Updated". False for cosmetic normalization (filling
+    # blank cells with 0/N/A). None = infer from new values/highlight.
+    tracking_change: Optional[bool] = None
+
     # Source column info (for writer)
     col_start: int = 0
 
@@ -189,6 +194,7 @@ class ScrapeResult:
             "new_year_adopted":self.new_year_adopted,
             "new_year_revised":self.new_year_revised,
             "new_link":       self.new_link,
+            "tracking_change":self.tracking_change,
             "col_start":      self.col_start,
         }
 
@@ -198,7 +204,11 @@ def blank_not_found_result(
     policy: PolicyEntry,
     notes: str,
 ) -> ScrapeResult:
-    """Normalize a blank policy block to 0 / N/A / N/A / N/A."""
+    """Normalize a blank policy block to 0 / N/A / N/A / N/A.
+
+    This is cosmetic bookkeeping, not a policy change, so tracking_change is
+    False to avoid flipping the district's status to "Policy Updated".
+    """
     return ScrapeResult(
         cds_code=district.cds_code,
         district_name=district.district_name,
@@ -213,6 +223,7 @@ def blank_not_found_result(
         new_year_adopted="N/A",
         new_year_revised="N/A",
         new_link="N/A",
+        tracking_change=False,
         col_start=policy.col_start,
     )
 

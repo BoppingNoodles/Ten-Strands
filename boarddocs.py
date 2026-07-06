@@ -127,9 +127,17 @@ async def check_policy(district: DistrictRecord, policy: PolicyEntry, session, d
         
     match = _find_matching_policy(policies, policy.policy_code)
     if not match:
+        # The policy wasn't matched in the API listing. That alone is NOT proof
+        # the on-file link is dead (the matcher can miss naming variants). If we
+        # have a real link, verify it with an HTTP check before flagging red;
+        # otherwise flag for review rather than assuming dead.
+        apply_policy_link(result, policy, None, via="BoardDocs API")
+        if policy.has_real_link:
+            import generic
+            return await generic.check_link(district, policy)
         result.action = ScapeAction.LINK_DEAD
         result.highlight_color = HighlightColor.RED
-        result.notes = "Policy not found in API"
+        result.notes = "Policy not found in BoardDocs API (no link on file)"
         return result
         
     rev_date = match.get("revised") or match.get("last_modified") or match.get("adopted")

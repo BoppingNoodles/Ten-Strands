@@ -31,68 +31,68 @@ def _is_blank_policy_block(policy) -> bool:
 def _not_found_result(district, policy, notes):
     return blank_not_found_result(district, policy, notes)
 
-async def scrape_district(district, session, simbli_ctx, sem, delay_min, delay_max):
-    """Process all policies for a single district."""
+async def scrape_district(district, session, simbli_ctx, delay_min, delay_max):
+    """Process all policies for a single district sequentially."""
     results = []
-    
-    async with sem:
-        print(f"[{district.district_name}] Starting policy processing...")
-        try:
-            for i, policy in enumerate(district.policies):
-                print(f"[{district.district_name}] Checking policy {i+1}/{len(district.policies)}: {policy.policy_code} (System: Simbli={policy.is_simbli}, BoardDocs={policy.is_boarddocs})")
-                if policy.is_no_database:
+
+    print(f"[{district.district_name}] Starting policy processing...")
+    try:
+        for i, policy in enumerate(district.policies):
+            print(f"[{district.district_name}] Checking policy {i+1}/{len(district.policies)}: {policy.policy_code} (System: Simbli={policy.is_simbli}, BoardDocs={policy.is_boarddocs})")
+            if policy.is_no_database:
+                res = ScrapeResult(
+                    cds_code=district.cds_code,
+                    district_name=district.district_name,
+                    policy_code=policy.policy_code,
+                    action=ScapeAction.NO_DATABASE,
+                    highlight_color=HighlightColor.NONE,
+                    notes="Skipped due to * indicator",
+                    col_start=policy.col_start
+                )
+                results.append(res)
+                continue
+
+            if policy.is_adopted:
+                # Check for revisions
+                if policy.is_simbli or (policy.has_real_link == False and district.simbli_id):
+                    res = await simbli.check_policy(district, policy, simbli_ctx, delay_min, delay_max)
+                elif policy.is_boarddocs or (policy.has_real_link == False and district.boarddocs_slug):
+                    res = await boarddocs.check_policy(district, policy, session, delay_min, delay_max)
+                elif policy.has_real_link:
+                    res = await generic.check_link(district, policy)
+                else:
                     res = ScrapeResult(
-                        cds_code=district.cds_code,
-                        district_name=district.district_name,
-                        policy_code=policy.policy_code,
-                        action=ScapeAction.NO_DATABASE,
-                        highlight_color=HighlightColor.NONE,
-                        notes="Skipped due to * indicator",
+                        cds_code=district.cds_code, district_name=district.district_name,
+                        policy_code=policy.policy_code, action=ScapeAction.SKIPPED,
+                        highlight_color=HighlightColor.NONE, notes="No link, no system ID",
                         col_start=policy.col_start
                     )
-                    results.append(res)
-                    continue
+                results.append(res)
 
-                if policy.is_adopted:
-                    # Check for revisions
-                    if policy.is_simbli or (policy.has_real_link == False and district.simbli_id):
-                        res = await simbli.check_policy(district, policy, simbli_ctx, delay_min, delay_max)
-                    elif policy.is_boarddocs or (policy.has_real_link == False and district.boarddocs_slug):
-                        res = await boarddocs.check_policy(district, policy, session, delay_min, delay_max)
-                    elif policy.has_real_link:
-                        res = await generic.check_link(district, policy)
+            elif policy.is_not_adopted:
+                # Check if newly adopted
+                if district.simbli_id:
+                    res = await simbli.search_for_policy(district, policy, simbli_ctx, delay_min, delay_max)
+                elif district.boarddocs_slug:
+                    res = await boarddocs.search_for_policy(district, policy, session, delay_min, delay_max)
+                else:
+                    if _is_blank_policy_block(policy):
+                        res = _not_found_result(
+                            district, policy, "No system ID to search; normalized blank policy cells to 0/N/A"
+                        )
                     else:
                         res = ScrapeResult(
                             cds_code=district.cds_code, district_name=district.district_name,
                             policy_code=policy.policy_code, action=ScapeAction.SKIPPED,
-                            highlight_color=HighlightColor.NONE, notes="No link, no system ID",
+                            highlight_color=HighlightColor.NONE, notes="No system ID to search",
                             col_start=policy.col_start
                         )
-                    results.append(res)
-                    
-                elif policy.is_not_adopted:
-                    # Check if newly adopted
-                    if district.simbli_id:
-                        res = await simbli.search_for_policy(district, policy, simbli_ctx, delay_min, delay_max)
-                    elif district.boarddocs_slug:
-                        res = await boarddocs.search_for_policy(district, policy, session, delay_min, delay_max)
-                    else:
-                        if _is_blank_policy_block(policy):
-                            res = _not_found_result(
-                                district, policy, "No system ID to search; normalized blank policy cells to 0/N/A"
-                            )
-                        else:
-                            res = ScrapeResult(
-                                cds_code=district.cds_code, district_name=district.district_name,
-                                policy_code=policy.policy_code, action=ScapeAction.SKIPPED,
-                                highlight_color=HighlightColor.NONE, notes="No system ID to search",
-                                col_start=policy.col_start
-                            )
-                    results.append(res)
-        except Exception as e:
-            print(f"[{district.district_name}] Error: {e}")
-            
+                results.append(res)
+    except Exception as e:
+        print(f"[{district.district_name}] Error: {e}")
+
     return results
+
 
 async def main_async(args):
     print(f"Loading data from '{args.input}' sheet '{args.sheet}'...")
@@ -118,23 +118,21 @@ async def main_async(args):
 
     await discover.discover_missing_platforms(districts, simbli_ctx)
     
-    valid_districts = districts
-    print(f"Found {len(districts)} districts. Proceeding with {len(valid_districts)}.")
+    print(f"Found {len(districts)} districts. Proceeding with all {len(districts)} sequentially.")
     print(
-        f"Pacing: concurrency={args.concurrency}, "
-        f"delay={args.delay_min:.1f}-{args.delay_max:.1f}s between Simbli requests"
+        f"Pacing: delay={args.delay_min:.1f}-{args.delay_max:.1f}s between Simbli requests, "
+        f"{args.inter_district_delay}s between districts"
     )
     
-    sem = asyncio.Semaphore(args.concurrency)
-    
     async with AsyncSession(impersonate='chrome110') as session:
-        tasks = [
-            scrape_district(d, session, simbli_ctx, sem, args.delay_min, args.delay_max) 
-            for d in valid_districts
-        ]
-        
-        print("Starting scrape...")
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        results = []
+        print("Starting scrape (sequential mode)...")
+        for i, d in enumerate(districts):
+            district_results = await scrape_district(d, session, simbli_ctx, args.delay_min, args.delay_max)
+            results.append(district_results)
+            if i < len(districts) - 1:
+                print(f"  [Pause] Waiting {args.inter_district_delay}s before next district...")
+                await asyncio.sleep(args.inter_district_delay)
         
     print("Closing browser...")
     driver.quit()
@@ -152,7 +150,7 @@ def main():
     parser.add_argument("--limit", type=int, default=None, help="Process max N districts")
     parser.add_argument("--start-row", type=int, default=None, help="Start at row number (inclusive)")
     parser.add_argument("--end-row", type=int, default=None, help="End at row number (inclusive)")
-    parser.add_argument("--concurrency", type=int, default=3, help="Max parallel districts")
+    parser.add_argument("--inter-district-delay", type=int, default=3, help="Seconds to wait between districts")
     parser.add_argument("--delay-min", type=float, default=2.5, help="Min seconds between Simbli requests")
     parser.add_argument("--delay-max", type=float, default=5.5, help="Max seconds between Simbli requests")
     

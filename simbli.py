@@ -56,7 +56,14 @@ def _wait_for_page(driver: uc.Chrome, extra_wait: float = 4.0):
 
 
 def _navigate(driver: uc.Chrome, url: str) -> bool:
-    """Navigate to url. Returns False on timeout/error."""
+    """Navigate to url. Returns False on timeout/error.
+
+    If `driver` is a BrowserSession (self-healing wrapper) and the Chrome
+    session has died, it is restarted automatically before navigating so a
+    long scrape can continue instead of churning out failed results.
+    """
+    if hasattr(driver, "ensure_alive"):
+        driver = driver.ensure_alive()
     try:
         driver.get(url)
         _human_pause(_NAV_PAUSE_MIN, _NAV_PAUSE_MAX)
@@ -119,6 +126,20 @@ def _get_policy_listing_api_rows(driver: uc.Chrome, simbli_id: str) -> list[dict
         data = driver.execute_async_script(
             """
             const done = arguments[0];
+            const getCoreAuthTokenFromCookies = () => {
+              const all = document.cookie.split(';');
+              for (const c of all) {
+                const [k, v] = c.trim().split('=');
+                if (k === 'CoreAuthToken') return decodeURIComponent(v);
+              }
+              return null;
+            };
+            const vars = window.__vars || {};
+            const sToken  = vars.sToken  || window.sToken  || '';
+            const enSID   = vars.enSID   || window.enSID   || '';
+            const enCuUID = vars.enCuUID || window.enCuUID || '';
+            const enPTID  = vars.enPTID  || window.enPTID  || '';
+            const enSectionID = vars.enSectionID || window.enSectionID || '';
             const api = "/Services/api/PolicyListing/?sct=" + sToken +
               "&ensid=" + enSID +
               "&enUID=" + enCuUID +
@@ -145,31 +166,50 @@ def _get_policy_listing_api_rows(driver: uc.Chrome, simbli_id: str) -> list[dict
 
 # ── Direct-link scraping ──────────────────────────────────────────────────────
 
-def _scrape_direct_link(driver: uc.Chrome, link: str) -> dict | None:
+def _scrape_direct_link(driver: uc.Chrome, link: str) -> dict:
     """
-    Visit a ViewPolicy page directly and extract:
-      - original_adopted_year
-      - last_revised_year
-    Returns a dict with those keys, or None if the page couldn't be parsed.
+    Visit a ViewPolicy page directly and classify what happened.
+
+    Returns a dict with a ``status`` key plus any parsed dates:
+      - {"status": "loaded", "original_adopted_year": ..., "last_revised_year": ...}
+        The page loaded AND looks like a real ViewPolicy page. Date keys may be
+        absent if the labels could not be parsed — the link is still alive.
+      - {"status": "not_policy_page"}
+        Something loaded but it is not a policy page (error/Cloudflare/landing).
+      - {"status": "navigation_failed"}
+        The browser could not reach the URL at all (timeout, connection error).
+
+    Callers must distinguish these: only "not_policy_page" or
+    "navigation_failed" are evidence of a dead link. "loaded" (even with no
+    parsed dates) means the link is alive.
     """
     print(f"      [Simbli] Trying direct link: {link}")
     ok = _navigate(driver, link)
     if not ok:
-        return None
+        return {"status": "navigation_failed"}
 
     _wait_for_page(driver, extra_wait=4.0)
 
     html = driver.page_source
     soup = BeautifulSoup(html, 'html.parser')
+    title = driver.title or ""
 
-    # Verify it's actually a ViewPolicy page and not an error/Cloudflare page
-    if "ViewPolicy" not in driver.current_url and "ViewPolicy" not in html[:500]:
-        # Check title contains policy number
-        if "View Policy" not in driver.title and "Policy" not in driver.title:
-            print(f"      [Simbli] Direct link does not appear to be a policy page.")
-            return None
+    # A real ViewPolicy page is identifiable by the URL and/or title. The page
+    # body is large and Angular-rendered; Cloudflare/Incapsula blocks produce
+    # tiny stubs (<~2KB), so a missing "ViewPolicy"/"View Policy" marker plus a
+    # small page means we landed on a block/error page, not the policy.
+    is_policy_url = "ViewPolicy" in driver.current_url or "ViewPolicy" in html[:500]
+    is_policy_title = "View Policy" in title or title.lower().startswith("view policy")
+    is_block_page = len(html) < 3000
 
-    result = {}
+    if not is_policy_url and not is_policy_title:
+        print(f"      [Simbli] Direct link does not appear to be a policy page "
+              f"(title={title!r}, len={len(html)}).")
+        if is_block_page:
+            return {"status": "navigation_failed"}
+        return {"status": "not_policy_page"}
+
+    result = {"status": "loaded"}
 
     # Look for "Original Adopted Date:" and "Last Revised Date:" labels
     for label_text in ["Original Adopted Date:", "Adopted Date:", "Adopted:"]:
@@ -190,7 +230,7 @@ def _scrape_direct_link(driver: uc.Chrome, link: str) -> dict | None:
                 result['last_revised_year'] = year
                 break
 
-    if not result:
+    if 'original_adopted_year' not in result and 'last_revised_year' not in result:
         # Try a broader approach — look for any date near the bottom metadata area
         metadata_area = soup.find("div", class_=re.compile(r"policy.?meta|meta.?data|policyDates", re.I))
         if metadata_area:
@@ -199,8 +239,9 @@ def _scrape_direct_link(driver: uc.Chrome, link: str) -> dict | None:
             if years:
                 result['last_revised_year'] = years[-1]
 
-    print(f"      [Simbli] Direct link result: {result or 'No dates found'}")
-    return result if result else None
+    dates = {k: v for k, v in result.items() if k.endswith("_year")}
+    print(f"      [Simbli] Direct link result: loaded, dates={dates or 'none parsed'}")
+    return result
 
 
 # ── Policy index scraping ─────────────────────────────────────────────────────
@@ -409,12 +450,13 @@ def _check_policy_sync(district: DistrictRecord, policy: PolicyEntry, driver: uc
     baseline_year = policy.max_year
 
     # ── Step 1: Try the direct link from the spreadsheet ──────────────────────
-    direct_result = None
+    direct_status = None
     if policy.has_real_link and policy.is_simbli:
         direct_result = _scrape_direct_link(driver, policy.link)
+        direct_status = direct_result.get("status")
 
-    if direct_result:
-        # Determine the best year from the direct page
+    if direct_status == "loaded":
+        # The link is alive. Decide revised vs unchanged from any parsed dates.
         found_year = direct_result.get('last_revised_year') or direct_result.get('original_adopted_year')
         if found_year and baseline_year:
             if int(found_year) > baseline_year:
@@ -425,21 +467,60 @@ def _check_policy_sync(district: DistrictRecord, policy: PolicyEntry, driver: uc
             else:
                 result.notes = f"Unchanged (via direct link): year={found_year}"
         else:
-            result.notes = f"Direct link OK, no parseable dates found"
+            result.notes = "Direct link OK, no parseable dates found"
         return result
 
-    # ── Step 2: Fall back to policy index scan ────────────────────────────────
-    print(f"      [Simbli] Falling back to index scan for {policy.policy_code}")
+    if direct_status in ("navigation_failed", "not_policy_page"):
+        # The page genuinely did not load as a policy page. Try the index as a
+        # second opinion before deciding the link is dead.
+        print(f"      [Simbli] Falling back to index scan (direct link {direct_status}) "
+              f"for {policy.policy_code}")
+        _human_pause()
+        rows = _get_policy_listing_sync(driver, district.simbli_id)
+        match = _find_matching_policy(rows, policy.policy_code)
+        if match:
+            years = _extract_years(match['date_text'])
+            found_year = years[-1] if years else None
+            apply_policy_link(result, policy, match.get("link"))
+            if found_year and baseline_year:
+                if int(found_year) > baseline_year:
+                    result.action = ScapeAction.REVISED
+                    result.highlight_color = HighlightColor.GREEN
+                    result.new_year_revised = found_year
+                    result.notes = f"Revised (via index): {baseline_year} → {found_year}"
+                else:
+                    result.notes = f"Unchanged (via index): year={found_year}"
+            else:
+                result.notes = "Could not parse year from index"
+            return result
+        # Index has no match either → genuinely dead.
+        apply_policy_link(result, policy, None)
+        result.action = ScapeAction.LINK_DEAD
+        result.highlight_color = HighlightColor.RED
+        result.notes = f"Link dead (direct {direct_status}; not in index)"
+        return result
+
+    # direct_status is None: no direct Simbli link to try. Use the index.
+    print(f"      [Simbli] No direct link; scanning index for {policy.policy_code}")
     _human_pause()
     try:
         rows = _get_policy_listing_sync(driver, district.simbli_id)
         match = _find_matching_policy(rows, policy.policy_code)
 
         if not match:
-            apply_policy_link(result, policy, None)
-            result.action = ScapeAction.LINK_DEAD
-            result.highlight_color = HighlightColor.RED
-            result.notes = "Policy not found in index (direct link also failed)"
+            if not rows:
+                # Index returned zero rows — likely a bot-block/rate-limit, not a dead link.
+                # Mark as skipped so the cell is not highlighted red.
+                result.action = ScapeAction.SKIPPED
+                result.highlight_color = HighlightColor.NONE
+                result.notes = "Index empty (possible bot block) — skipped, not marked dead"
+            else:
+                # Policy marked adopted but has no link and is absent from the
+                # district's Simbli index — flag for human review.
+                apply_policy_link(result, policy, None)
+                result.action = ScapeAction.LINK_DEAD
+                result.highlight_color = HighlightColor.RED
+                result.notes = "Adopted policy not found in Simbli index (no link on file)"
             return result
 
         years = _extract_years(match['date_text'])
