@@ -66,8 +66,10 @@ Each user needs their own copy of the tracking spreadsheet (for example `Summer 
 - `make_district_folders.py`, `rename_pdfs.py` — unrelated utilities
 
 ### Download district policy pdfs
-
-python download_pdfs.py --input "Summer 2026 Board Policy Indicator Refresh Data Tracker.xlsx" --sheet Caden --start-row # --end-row # --chrome-version 149
+Run this command (this will create a folder called 'Ten Strands' in your current directory and in that folder, create sub folders for each district
+```bash
+python download_pdfs.py --input "Summer 2026 Board Policy Indicator Refresh Data Tracker.xlsx" --sheet Caden --start-row 3 --end-row 315 --chrome-version 149
+```
 
 ## Notes
 
