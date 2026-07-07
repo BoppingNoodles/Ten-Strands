@@ -65,6 +65,10 @@ Each user needs their own copy of the tracking spreadsheet (for example `Summer 
 - `test_*.py`, `debug_*.html` — development/debug scripts
 - `make_district_folders.py`, `rename_pdfs.py` — unrelated utilities
 
+### Download district policy pdfs
+
+python download_pdfs.py --input "Summer 2026 Board Policy Indicator Refresh Data Tracker.xlsx" --sheet Caden --start-row # --end-row # --chrome-version 149
+
 ## Notes
 
 - Simbli scraping opens a real Chrome window via `undetected-chromedriver`.
