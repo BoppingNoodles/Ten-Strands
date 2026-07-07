@@ -12,21 +12,41 @@ Example:
 
 Only BP/AR policy quads are considered. Resolution columns (RES-*) are skipped.
 
-The download strategies are added in follow-up commits.
+How PDFs are produced
+---------------------
+The workbook link cell is usually an HTML page, not a PDF:
+  - Simbli   : .../Policy/ViewPolicy.aspx?S=...   (HTML, behind Cloudflare)
+  - BoardDocs: .../Board.nsf/goto?open&id=...      (HTML)
+  - District : https://berkeleyschools.net/...pdf   (already a PDF)
+
+This script uses a hybrid, Chrome-centric strategy:
+  - If the URL ends in ``.pdf``  -> download the original file directly (lossless).
+  - Otherwise                    -> load the page in undetected-chromedriver
+                                     (bypasses Cloudflare, same engine the scraper
+                                     uses) and print it to PDF via Chrome DevTools
+                                     ``Page.printToPDF``. This works uniformly for
+                                     Simbli, BoardDocs, and any other platform.
 
 Usage
 -----
     python download_pdfs.py --input "Summer_2026_Scraped_20260702_095536.xlsx" --sheet Caden
+    python download_pdfs.py --input ... --sheet Caden --limit 5                 # test run
+    python download_pdfs.py --input ... --sheet Caden --start-row 3 --end-row 20
+    python download_pdfs.py --input ... --sheet Caden --overwrite              # re-download
+    python download_pdfs.py --input ... --sheet Caden --dry-run                # preview only
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import json
 import os
+import random
 import re
 import sys
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -221,6 +241,68 @@ async def _download_direct_async(url: str, dest_path: str) -> None:
                     fh.write(chunk)
 
 
+# ── Chrome HTML → PDF rendering ───────────────────────────────────────────────
+
+# Pacing between downloads — keeps requests human-paced to avoid anti-bot blocks.
+_PACE_MIN = 1.5
+_PACE_MAX = 3.0
+
+
+def _wait_for_render(driver, url: str, timeout: float = 25.0) -> bool:
+    """
+    Wait for the page to clear Cloudflare/anti-bot checks and render.
+    Returns True if the page looks like it loaded normally.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            title = driver.title or ""
+        except Exception:
+            title = ""
+        try:
+            src = driver.page_source or ""
+            html_len = len(src)
+        except Exception:
+            html_len = 0
+        if "Just a moment" in title or "cf-browser-verification" in src[:2000]:
+            time.sleep(1.5)
+            continue
+        # Give Angular/SPA content a moment to populate after the shell loads.
+        if html_len > 3000:
+            time.sleep(2.0)
+            return True
+        time.sleep(1.0)
+    return False
+
+
+def render_pdf_via_chrome(driver, url: str, dest_path: str) -> None:
+    """
+    Load ``url`` in Chrome and save a PDF of the rendered page via DevTools.
+    Used for Simbli, BoardDocs, and any non-.pdf HTML page.
+    """
+    driver.get(url)
+    # Generous wait — Simbli sits behind Cloudflare and renders via Angular.
+    _wait_for_render(driver, url, timeout=30.0)
+    time.sleep(2.0)  # let late-rendering content settle
+
+    result = driver.execute_cdp_cmd(
+        "Page.printToPDF",
+        {
+            "printBackground": True,
+            "preferCSSPageSize": True,
+            "marginTop": 0.4,
+            "marginBottom": 0.4,
+            "marginLeft": 0.4,
+            "marginRight": 0.4,
+        },
+    )
+    pdf_bytes = base64.b64decode(result["data"])
+    if not pdf_bytes:
+        raise RuntimeError("Chrome returned an empty PDF")
+    with open(dest_path, "wb") as fh:
+        fh.write(pdf_bytes)
+
+
 # ── Per-task processing ───────────────────────────────────────────────────────
 
 def unique_path(dest_path: str) -> str:
@@ -236,14 +318,15 @@ def unique_path(dest_path: str) -> str:
         counter += 1
 
 
-def process_task(task: dict, base_dir: str, overwrite: bool) -> dict:
+def process_task(driver, task: dict, base_dir: str, overwrite: bool,
+                 dry_run: bool = False) -> dict:
     """
     Download one policy PDF. Returns a result record for the manifest.
     status ∈ {downloaded, exists, failed}
 
-    Direct-PDF links are streamed to disk here. HTML pages (Simbli, BoardDocs,
-    district sites) are rendered to PDF via Chrome in a later commit; until then
-    they are recorded as failed with a clear reason.
+    Direct-PDF links are streamed to disk. HTML pages (Simbli, BoardDocs,
+    district sites) are rendered to PDF via Chrome's Page.printToPDF.
+    If dry_run=True no file is written and status is set to 'downloaded'.
     """
     record = {
         **{k: task[k] for k in ("row", "county", "district", "policy_code",
@@ -272,24 +355,26 @@ def process_task(task: dict, base_dir: str, overwrite: bool) -> dict:
         record["method"] = "skip"
         return record
 
+    if dry_run:
+        record["status"] = "downloaded"
+        record["method"] = "direct" if is_direct_pdf(task["link"]) else "chrome"
+        return record
+
     os.makedirs(district_folder, exist_ok=True)
     # Avoid clobbering an existing differently-sourced file when re-running.
     dest_path = unique_path(dest_path)
     record["dest"] = dest_path
 
-    if is_direct_pdf(task["link"]):
-        method = "direct"
-    else:
-        # Chrome HTML->PDF rendering lands in the next commit.
-        method = "chrome"
-
+    method = "direct" if is_direct_pdf(task["link"]) else "chrome"
     record["method"] = method
     try:
         if method == "direct":
             asyncio.run(_download_direct_async(task["link"], dest_path))
-            record["status"] = "downloaded"
         else:
-            raise NotImplementedError("Chrome HTML->PDF not implemented yet")
+            if driver is None:
+                raise RuntimeError("Chrome driver not available")
+            render_pdf_via_chrome(driver, task["link"], dest_path)
+        record["status"] = "downloaded"
     except Exception as exc:  # noqa: BLE001 — record every failure, keep going
         record["status"] = "failed"
         record["error"] = f"{type(exc).__name__}: {exc}"
@@ -323,6 +408,10 @@ def main() -> None:
                         help="Last workbook data row to process (1-based)")
     parser.add_argument("--overwrite", action="store_true",
                         help="Re-download even if the target PDF already exists")
+    parser.add_argument("--dry-run", "-n", action="store_true",
+                        help="Plan only — create folders but do not download")
+    parser.add_argument("--chrome-version", type=int, default=None,
+                        help="Pin a Chrome major version (e.g. 149). Auto-detects if omitted.")
     args = parser.parse_args()
 
     if not os.path.isfile(args.input):
@@ -354,23 +443,51 @@ def main() -> None:
     base_dir = os.path.join(args.output_dir, PARENT_FOLDER)
     os.makedirs(base_dir, exist_ok=True)
     print(f"Output folder: {os.path.abspath(base_dir)}")
+    if args.dry_run:
+        print("*** DRY-RUN — folders planned, nothing will be downloaded ***")
+
+    # Decide whether we need a browser at all.
+    need_chrome = any(not is_direct_pdf(t["link"]) for t in tasks) and not args.dry_run
+
+    driver = None
+    if need_chrome:
+        import undetected_chromedriver as uc
+        print("Initializing Chrome for HTML->PDF rendering...")
+        options = uc.ChromeOptions()
+        kwargs = {"options": options}
+        if args.chrome_version:
+            kwargs["version_main"] = args.chrome_version
+        driver = uc.Chrome(**kwargs)
+        driver.set_page_load_timeout(45)
 
     # ── Run ──────────────────────────────────────────────────────────────────
     results = []
     counts = {"downloaded": 0, "exists": 0, "failed": 0}
-    total = len(tasks)
-    for i, task in enumerate(tasks, 1):
-        prefix = f"[{i}/{total}] {task['district']} | {task['policy_code']}"
-        rec = process_task(task, base_dir, overwrite=args.overwrite)
-        results.append(rec)
-        counts[rec["status"]] = counts.get(rec["status"], 0) + 1
+    try:
+        total = len(tasks)
+        for i, task in enumerate(tasks, 1):
+            prefix = f"[{i}/{total}] {task['district']} | {task['policy_code']}"
+            rec = process_task(driver, task, base_dir,
+                               overwrite=args.overwrite, dry_run=args.dry_run)
+            results.append(rec)
+            counts[rec["status"]] = counts.get(rec["status"], 0) + 1
 
-        if rec["status"] == "downloaded":
-            print(f"{prefix} -> OK ({rec['method']})")
-        elif rec["status"] == "exists":
-            print(f"{prefix} -> exists, skipped")
-        else:
-            print(f"{prefix} -> FAILED: {rec['error']}")
+            if rec["status"] == "downloaded":
+                print(f"{prefix} -> OK ({rec['method']})")
+            elif rec["status"] == "exists":
+                print(f"{prefix} -> exists, skipped")
+            else:
+                print(f"{prefix} -> FAILED: {rec['error']}")
+
+            # Human-paced delay between requests.
+            if i < total:
+                time.sleep(random.uniform(_PACE_MIN, _PACE_MAX))
+    finally:
+        if driver is not None:
+            try:
+                driver.quit()
+            except Exception:
+                pass
 
     # ── Manifest + summary ───────────────────────────────────────────────────
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -385,6 +502,8 @@ def main() -> None:
     print(f"  Downloaded : {counts.get('downloaded', 0)}")
     print(f"  Exists     : {counts.get('exists', 0)}")
     print(f"  Failed     : {counts.get('failed', 0)}")
+    if args.dry_run:
+        print("  (dry-run: no files were actually downloaded)")
     print()
 
 
