@@ -22,11 +22,15 @@ Usage
 from __future__ import annotations
 
 import argparse
+import asyncio
+import json
 import os
 import re
 import sys
+from datetime import datetime
 from typing import Optional
 
+import httpx
 import openpyxl
 
 # Column layout (value | adopted | revised | link quads) is shared with the
@@ -183,7 +187,122 @@ def load_tasks(filepath: str, sheet: str,
     return tasks
 
 
-# ── Entry point (download strategies land in later commits) ───────────────────
+# ── Download routing ──────────────────────────────────────────────────────────
+
+# Realistic browser headers for direct PDF downloads (some hosts block default UA).
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "application/pdf,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+
+def is_direct_pdf(url: str) -> bool:
+    """Heuristic: a URL whose path ends in .pdf is downloaded as-is."""
+    path = url.split("?", 1)[0].split("#", 1)[0]
+    return path.lower().endswith(".pdf")
+
+
+async def _download_direct_async(url: str, dest_path: str) -> None:
+    """Stream a direct PDF link to disk with browser-like headers."""
+    async with httpx.AsyncClient(
+        follow_redirects=True, timeout=60.0, headers=BROWSER_HEADERS
+    ) as client:
+        async with client.stream("GET", url) as resp:
+            resp.raise_for_status()
+            with open(dest_path, "wb") as fh:
+                async for chunk in resp.aiter_bytes():
+                    fh.write(chunk)
+
+
+# ── Per-task processing ───────────────────────────────────────────────────────
+
+def unique_path(dest_path: str) -> str:
+    """If dest_path exists, append _1, _2, ... until free."""
+    if not os.path.exists(dest_path):
+        return dest_path
+    stem, ext = os.path.splitext(dest_path)
+    counter = 1
+    while True:
+        candidate = f"{stem}_{counter}{ext}"
+        if not os.path.exists(candidate):
+            return candidate
+        counter += 1
+
+
+def process_task(task: dict, base_dir: str, overwrite: bool) -> dict:
+    """
+    Download one policy PDF. Returns a result record for the manifest.
+    status ∈ {downloaded, exists, failed}
+
+    Direct-PDF links are streamed to disk here. HTML pages (Simbli, BoardDocs,
+    district sites) are rendered to PDF via Chrome in a later commit; until then
+    they are recorded as failed with a clear reason.
+    """
+    record = {
+        **{k: task[k] for k in ("row", "county", "district", "policy_code",
+                                 "policy_title", "link")},
+        "dest": None,
+        "method": None,
+        "status": None,
+        "error": None,
+    }
+
+    filename = build_filename(
+        task["policy_code"], task["policy_title"], task["county"],
+        task["district"], task["year_adopted"], task["year_revised"],
+    )
+    if not filename:
+        record["status"] = "failed"
+        record["error"] = "Could not build filename (non-BP/AR code?)"
+        return record
+
+    district_folder = os.path.join(base_dir, sanitize(task["district"]))
+    dest_path = os.path.join(district_folder, filename)
+    record["dest"] = dest_path
+
+    if os.path.exists(dest_path) and not overwrite:
+        record["status"] = "exists"
+        record["method"] = "skip"
+        return record
+
+    os.makedirs(district_folder, exist_ok=True)
+    # Avoid clobbering an existing differently-sourced file when re-running.
+    dest_path = unique_path(dest_path)
+    record["dest"] = dest_path
+
+    if is_direct_pdf(task["link"]):
+        method = "direct"
+    else:
+        # Chrome HTML->PDF rendering lands in the next commit.
+        method = "chrome"
+
+    record["method"] = method
+    try:
+        if method == "direct":
+            asyncio.run(_download_direct_async(task["link"], dest_path))
+            record["status"] = "downloaded"
+        else:
+            raise NotImplementedError("Chrome HTML->PDF not implemented yet")
+    except Exception as exc:  # noqa: BLE001 — record every failure, keep going
+        record["status"] = "failed"
+        record["error"] = f"{type(exc).__name__}: {exc}"
+        # Clean up a partial/empty file so re-runs retry cleanly.
+        try:
+            if os.path.exists(dest_path) and os.path.getsize(dest_path) == 0:
+                os.remove(dest_path)
+        except OSError:
+            pass
+    return record
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -202,6 +321,8 @@ def main() -> None:
                         help="First workbook data row to process (1-based)")
     parser.add_argument("--end-row", type=int, default=None,
                         help="Last workbook data row to process (1-based)")
+    parser.add_argument("--overwrite", action="store_true",
+                        help="Re-download even if the target PDF already exists")
     args = parser.parse_args()
 
     if not os.path.isfile(args.input):
@@ -234,9 +355,37 @@ def main() -> None:
     os.makedirs(base_dir, exist_ok=True)
     print(f"Output folder: {os.path.abspath(base_dir)}")
 
-    print("\nPlanned downloads (download logic lands in the next commit):")
-    for i, t in enumerate(tasks, 1):
-        print(f"  [{i}/{len(tasks)}] {t['district']} | {t['policy_code']} -> {t['link']}")
+    # ── Run ──────────────────────────────────────────────────────────────────
+    results = []
+    counts = {"downloaded": 0, "exists": 0, "failed": 0}
+    total = len(tasks)
+    for i, task in enumerate(tasks, 1):
+        prefix = f"[{i}/{total}] {task['district']} | {task['policy_code']}"
+        rec = process_task(task, base_dir, overwrite=args.overwrite)
+        results.append(rec)
+        counts[rec["status"]] = counts.get(rec["status"], 0) + 1
+
+        if rec["status"] == "downloaded":
+            print(f"{prefix} -> OK ({rec['method']})")
+        elif rec["status"] == "exists":
+            print(f"{prefix} -> exists, skipped")
+        else:
+            print(f"{prefix} -> FAILED: {rec['error']}")
+
+    # ── Manifest + summary ───────────────────────────────────────────────────
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    manifest_path = os.path.join(base_dir, f"download_manifest_{ts}.json")
+    with open(manifest_path, "w", encoding="utf-8") as fh:
+        json.dump(results, fh, indent=2)
+    print(f"\nManifest written: {manifest_path}")
+
+    print(f"\n{'═' * 60}")
+    print("  Summary")
+    print(f"{'═' * 60}")
+    print(f"  Downloaded : {counts.get('downloaded', 0)}")
+    print(f"  Exists     : {counts.get('exists', 0)}")
+    print(f"  Failed     : {counts.get('failed', 0)}")
+    print()
 
 
 if __name__ == "__main__":
