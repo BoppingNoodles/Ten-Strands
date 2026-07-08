@@ -450,15 +450,20 @@ def main() -> None:
     need_chrome = any(not is_direct_pdf(t["link"]) for t in tasks) and not args.dry_run
 
     driver = None
+    get_driver = None
     if need_chrome:
         import undetected_chromedriver as uc
-        print("Initializing Chrome for HTML->PDF rendering...")
-        options = uc.ChromeOptions()
-        kwargs = {"options": options}
-        if args.chrome_version:
-            kwargs["version_main"] = args.chrome_version
-        driver = uc.Chrome(**kwargs)
-        driver.set_page_load_timeout(45)
+        def _create_driver():
+            print("Initializing Chrome for HTML->PDF rendering...")
+            options = uc.ChromeOptions()
+            kwargs = {"options": options}
+            if args.chrome_version:
+                kwargs["version_main"] = args.chrome_version
+            d = uc.Chrome(**kwargs)
+            d.set_page_load_timeout(45)
+            return d
+        get_driver = _create_driver
+        driver = get_driver()
 
     # ── Run ──────────────────────────────────────────────────────────────────
     results = []
@@ -466,9 +471,33 @@ def main() -> None:
     try:
         total = len(tasks)
         for i, task in enumerate(tasks, 1):
+            # Preemptively recycle the browser every 100 tasks to prevent memory leaks
+            if need_chrome and i > 1 and i % 100 == 0:
+                print("Recycling Chrome instance to free memory...")
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+                driver = get_driver()
+
             prefix = f"[{i}/{total}] {task['district']} | {task['policy_code']}"
-            rec = process_task(driver, task, base_dir,
-                               overwrite=args.overwrite, dry_run=args.dry_run)
+            
+            for attempt in range(2):
+                rec = process_task(driver, task, base_dir,
+                                   overwrite=args.overwrite, dry_run=args.dry_run)
+                
+                # If the browser crashed, restart it and retry the task once
+                if rec["status"] == "failed" and "InvalidSessionIdException" in str(rec.get("error", "")):
+                    if attempt == 0 and need_chrome:
+                        print(f"  Browser crashed (InvalidSessionIdException). Restarting Chrome and retrying...")
+                        try:
+                            driver.quit()
+                        except Exception:
+                            pass
+                        driver = get_driver()
+                        continue
+                break
+
             results.append(rec)
             counts[rec["status"]] = counts.get(rec["status"], 0) + 1
 
