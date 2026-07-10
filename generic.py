@@ -26,6 +26,11 @@ async def check_link(district: DistrictRecord, policy: PolicyEntry) -> ScrapeRes
         async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
             resp = await client.head(url)
             
+            # Many servers (BoardDocs, district sites) block HEAD but allow GET.
+            # Retry with GET on 403/405 before treating as an error.
+            if resp.status_code in (403, 405):
+                resp = await client.get(url)
+
             # Google Drive often returns 403 or redirects to login if restricted, or 200 if open.
             # 404/410 means dead
             if resp.status_code in [404, 410]:
