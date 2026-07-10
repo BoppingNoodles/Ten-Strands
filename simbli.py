@@ -452,8 +452,16 @@ def _check_policy_sync(district: DistrictRecord, policy: PolicyEntry, driver: uc
     # ── Step 1: Try the direct link from the spreadsheet ──────────────────────
     direct_status = None
     if policy.has_real_link and policy.is_simbli:
-        direct_result = _scrape_direct_link(driver, policy.link)
-        direct_status = direct_result.get("status")
+        # Simbli links with a blank secid= parameter reliably fail (navigation_failed).
+        # Skip the direct link and fall through to the index scan immediately.
+        import urllib.parse as _up
+        _qs = _up.parse_qs(_up.urlparse(policy.link).query)
+        _secid = _qs.get("secid", [""])[0].strip()
+        if _secid:
+            direct_result = _scrape_direct_link(driver, policy.link)
+            direct_status = direct_result.get("status")
+        else:
+            print(f"      [Simbli] Skipping direct link (blank secid) for {policy.policy_code}, falling back to index")
 
     if direct_status == "loaded":
         # The link is alive. Decide revised vs unchanged from any parsed dates.
