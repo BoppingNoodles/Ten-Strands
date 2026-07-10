@@ -148,6 +148,7 @@ def main():
     parser.add_argument("--sheet", default="Caden")
     parser.add_argument("--pilot", action="store_true", help="Run only first 5 districts")
     parser.add_argument("--limit", type=int, default=None, help="Process max N districts")
+    parser.add_argument("--concurrency", type=int, default=3, help="Number of parallel districts to process")
     parser.add_argument("--start-row", type=int, default=None, help="Start at row number (inclusive)")
     parser.add_argument("--end-row", type=int, default=None, help="End at row number (inclusive)")
     parser.add_argument("--inter-district-delay", type=int, default=3, help="Seconds to wait between districts")

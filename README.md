@@ -15,14 +15,18 @@ pip install -r requirements.txt
 ## Run the scraper
 
 ```bash
-python scrape_policies.py --input "Summer 2026 Board Policy Indicator Refresh Data Tracker.xlsx" --sheet Caden
+python scrape_policies.py --input "Summer 2026 Board Policy Indicator Refresh Data Tracker.xlsx" --sheet Caden --inter-district-delay 8 --delay-min 3.5 --delay-max 6.5
 ```
 
 Useful options:
 
 - `--start-row 121 --end-row 200` — process a row range
 - `--limit 5` or `--pilot` — small test run
-- `--concurrency 5` — parallel districts (default 5)
+- `--concurrency 3` — parallel districts (default 3)
+
+> [!TIP]
+> **Anti-Bot Settings:** Simbli has strict Cloudflare bot-protection. To prevent massive blocks of skipped districts, always use a slow, human-paced delay. 
+> Recommended settings: `--inter-district-delay 8 --delay-min 3.5 --delay-max 6.5`
 
 Output files are created automatically:
 
