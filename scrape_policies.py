@@ -94,6 +94,40 @@ async def scrape_district(district, session, simbli_ctx, delay_min, delay_max):
     return results
 
 
+class BrowserSession:
+    def __init__(self):
+        self.driver = self._create_driver()
+
+    def _create_driver(self):
+        import undetected_chromedriver as uc
+        print("  [BrowserSession] Initializing Chrome...")
+        options = uc.ChromeOptions()
+        d = uc.Chrome(options=options, version_main=149)
+        d.set_page_load_timeout(30)
+        return d
+
+    def ensure_alive(self):
+        try:
+            self.driver.current_url
+            return self.driver
+        except Exception:
+            print("  [BrowserSession] Chrome crashed. Restarting...")
+            try:
+                self.driver.quit()
+            except Exception:
+                pass
+            self.driver = self._create_driver()
+            return self.driver
+
+    def __getattr__(self, name):
+        return getattr(self.driver, name)
+
+    def quit(self):
+        try:
+            self.driver.quit()
+        except Exception:
+            pass
+
 async def main_async(args):
     print(f"Loading data from '{args.input}' sheet '{args.sheet}'...")
     districts = reader.load_districts(
@@ -108,11 +142,8 @@ async def main_async(args):
     # (via real Chrome browser to bypass anti-bot) to discover their Simbli or
     # BoardDocs platform. Must happen after the browser is initialized.
 
-    import undetected_chromedriver as uc
     print("Initializing browser for Simbli...")
-    options = uc.ChromeOptions()
-    driver = uc.Chrome(options=options, version_main=149)
-    driver.set_page_load_timeout(30)
+    driver = BrowserSession()
     simbli_lock = asyncio.Lock()
     simbli_ctx = (driver, simbli_lock)
 
