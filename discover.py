@@ -22,9 +22,21 @@ _BOARDDOCS_URL_RE = re.compile(
 def _search_google_sync(driver, query: str) -> str:
     """Navigate to Google search and return the page source. Runs synchronously."""
     search_url = "https://www.google.com/search?q=" + query.replace(' ', '+') + "&num=5"
-    driver.get(search_url)
-    time.sleep(2)  # Let the page settle
-    return driver.page_source
+    if hasattr(driver, "ensure_alive"):
+        driver = driver.ensure_alive()
+    try:
+        driver.get(search_url)
+        time.sleep(2)  # Let the page settle
+        return driver.page_source
+    except Exception as e:
+        print(f"  [Discover] Google search failed (browser crash/timeout): {type(e).__name__}")
+        # Force the session dead so the next ensure_alive() restarts it
+        if hasattr(driver, "driver"):
+            try:
+                driver.driver.quit()
+            except Exception:
+                pass
+        return ""
 
 
 def _extract_simbli_id(html: str) -> str | None:
