@@ -74,7 +74,23 @@ Run this command (this will create a folder called 'Ten Strands' in your current
 ```bash
 python download_pdfs.py --input "Summer 2026 Board Policy Indicator Refresh Data Tracker.xlsx" --sheet Caden --start-row 3 --end-row 315 --chrome-version 149
 ```
+---
 
+# Reorganize PDFs by Policy
+
+Once PDFs are downloaded and sorted by district, `reorganize_by_policy.py` re-sorts copies of them by **policy** instead, so you can see every district's version of a given policy (e.g. `BP 3510 Green Schools Operations`) in one folder.
+
+- Files are **copied**, not moved — the original district folders are left untouched.
+- Folder names are matched against a canonical, hardcoded policy list (`CANONICAL_POLICIES` in the script), keyed on policy type + number, so slightly different title wording between districts doesn't create duplicate folders.
+- Any PDF that doesn't match the expected naming convention, or whose policy number isn't in the canonical list, is skipped and reported at the end of the run.
+
+### Setup
+
+Save `reorganize_by_policy.py` **directly inside the `Ten Strands` folder** created by `download_pdfs.py` (i.e. the folder that directly contains the district subfolders like `ABC Unified`, `Acalanes Union High`, etc). This is what `download_pdfs.py` produces by default, so no extra configuration is needed.
+
+### Run
+
+From inside that `Ten Strands` folder:
 ## Notes
 
 - Simbli scraping opens a real Chrome window via `undetected-chromedriver`.
