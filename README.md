@@ -91,6 +91,21 @@ Save `reorganize_by_policy.py` **directly inside the `Ten Strands` folder** crea
 ### Run
 
 From inside that `Ten Strands` folder:
+`python reorganize_by_policy.py`
+### Output
+
+Creates a new folder alongside the district folders:
+Ten Strands/
+└── By Policy/
+├── AR 3511.1 Integrated Waste Management/
+│   ├── AR_3511.1_Integrated Waste Management Regulation_Los Angeles_ABC Unified_2019_2019.pdf
+│   ├── AR_3511.1_Integrated Waste Management Regulation_Alameda_Acalanes Union High_2020_2021.pdf
+│   └── ...
+├── BP 3510 Green Schools Operations/
+│   └── ...
+└── ...
+
+At the end of the run, the script prints how many PDFs were successfully copied out of the total found (e.g. `Copied 280/312 PDF(s)`), plus a list of any skipped files and why.
 ## Notes
 
 - Simbli scraping opens a real Chrome window via `undetected-chromedriver`.
