@@ -522,6 +522,12 @@ def _check_policy_sync(district: DistrictRecord, policy: PolicyEntry, driver: uc
                 result.action = ScapeAction.SKIPPED
                 result.highlight_color = HighlightColor.NONE
                 result.notes = "Index empty (possible bot block) — skipped, not marked dead"
+            elif _is_safe_routes_target(policy.policy_code):
+                # Safe Routes is never highlighted; if it's absent from the index just skip
+                # rather than flagging red — the policy may exist under a variant name.
+                result.action = ScapeAction.SKIPPED
+                result.highlight_color = HighlightColor.NONE
+                result.notes = "Safe Routes policy not found in Simbli index — skipped for human review"
             else:
                 # Policy marked adopted but has no link and is absent from the
                 # district's Simbli index — flag for human review.
