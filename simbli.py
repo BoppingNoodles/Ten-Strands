@@ -592,7 +592,7 @@ def _search_for_policy_sync(district: DistrictRecord, policy: PolicyEntry, drive
                 "Policy not found; normalized blank cells to 0/N/A",
             )
         elif _is_safe_routes_target(policy.policy_code):
-            _safe_routes_not_found_result(result)
+            return _safe_routes_not_found_result(result)
 
     except Exception as exc:
         result.action = ScapeAction.ERROR
