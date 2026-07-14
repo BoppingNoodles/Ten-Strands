@@ -146,7 +146,11 @@ def _get_policy_listing_api_rows(driver: uc.Chrome, simbli_id: str) -> list[dict
               "&ismobile=false" +
               "&ptid=" + enPTID +
               "&secid=" + enSectionID;
-            fetch(api, { headers: { Authorization: `Bearer ${getCoreAuthTokenFromCookies()}` } })
+            const headers = {};
+            const token = getCoreAuthTokenFromCookies();
+            if (token) headers['Authorization'] = `Bearer ${token}`;
+            
+            fetch(api, { headers })
               .then((response) => response.json())
               .then((data) => done(data))
               .catch((error) => done({ error: String(error) }));
