@@ -69,12 +69,34 @@ Each user needs their own copy of the tracking spreadsheet (for example `Summer 
 - `test_*.py`, `debug_*.html` — development/debug scripts
 - `make_district_folders.py`, `rename_pdfs.py` — unrelated utilities
 
-### Download district policy pdfs
+# Download district policy pdfs
 Run this command (this will create a folder called 'Ten Strands' in your current directory and in that folder, create sub folders for each district). It will skip districts that have already been downloaded
 ```bash
 python download_pdfs.py --input "Summer 2026 Board Policy Indicator Refresh Data Tracker.xlsx" --sheet Caden --start-row 3 --end-row 315 --chrome-version 149
 ```
+---
 
+# Reorganize PDFs by Policy
+
+Once PDFs are downloaded and sorted by district, `reorganize_by_policy.py` re-sorts copies of them by **policy** instead, so you can see every district's version of a given policy (e.g. `BP 3510 Green Schools Operations`) in one folder.
+
+- Files are **copied**, not moved — the original district folders are left untouched.
+- Folder names are matched against a canonical, hardcoded policy list (`CANONICAL_POLICIES` in the script), keyed on policy type + number, so slightly different title wording between districts doesn't create duplicate folders.
+- Any PDF that doesn't match the expected naming convention, or whose policy number isn't in the canonical list, is skipped and reported at the end of the run.
+
+### Setup
+
+Save `reorganize_by_policy.py` **directly inside the `Ten Strands` folder** created by `download_pdfs.py` (i.e. the folder that directly contains the district subfolders like `ABC Unified`, `Acalanes Union High`, etc). This is what `download_pdfs.py` produces by default, so no extra configuration is needed.
+
+### Run
+
+From inside that `Ten Strands` folder:
+`python reorganize_by_policy.py`
+### Output
+
+Creates a new folder called By Policy alongside the district folders inside Ten Strands. Inside By Policy, there's one subfolder per canonical policy (for example "AR 3511.1 Integrated Waste Management" or "BP 3510 Green Schools Operations"), and each of those subfolders contains copies of every district's PDF for that policy.
+
+At the end of the run, the script prints how many PDFs were successfully copied out of the total found (e.g. `Copied 280/312 PDF(s)`), plus a list of any skipped files and why.
 ## Notes
 
 - Simbli scraping opens a real Chrome window via `undetected-chromedriver`.
