@@ -28,11 +28,14 @@ DEST_DIR = os.path.join(BASE_DIR, "By Policy")
 SKIP_FOLDERS = {"By Policy"}
 # -----------------
 
-# Matches: <BP/AR>_<PolicyNumber>_<PolicyTitle>_...(rest ignored)
-# Title is captured loosely; the canonical title/folder comes from CANONICAL_POLICIES below,
-# keyed strictly on (doctype, number) so title-wording differences across districts don't matter.
+# Matches: <BP/AR>_<PolicyNumber>_<PolicyTitle>_<County>_<District>_<YearAdopted>_<YearRevised>.pdf
+# Fields are underscore-delimited; title/county/district may contain spaces and periods but not
+# underscores. Year fields may be a 4-digit year OR the literal "NA".
+# The canonical title/folder comes from CANONICAL_POLICIES below, keyed strictly on
+# (doctype, number), so title-wording differences across districts don't matter.
 FILENAME_PATTERN = re.compile(
-    r"^(?P<doctype>BP|AR)[ _]+(?P<number>[\w.]+)[ _]+(?P<title>.+?)_[^_]+_[^_]+_\d{4}_\d{4}\.pdf$",
+    r"^(?P<doctype>BP|AR)_(?P<number>\d+(?:\.\d+)?)_(?P<title>[^_]+)_(?P<county>[^_]+)_"
+    r"(?P<district>[^_]+)_(?P<year_adopted>\d{4}|NA)_(?P<year_revised>\d{4}|NA)\.pdf$",
     re.IGNORECASE,
 )
 
