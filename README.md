@@ -58,6 +58,12 @@ Each user needs their own copy of the tracking spreadsheet (for example `Summer 
 | `inspect_workbook_policy_issues.py` | Scan a workbook for blank blocks and invalid links |
 | `verify_scrape_output.py` | Compare a scrape log against a written workbook |
 
+### Analysis
+
+| File | Purpose |
+|------|---------|
+| `analysis/compare_policy_language.py` | Compare district policy PDFs with templates or cluster by language similarity |
+
 ### Not needed to run the scraper
 
 - `Summer_2026_Scraped_*.xlsx`, `scrape_log_*.json` — generated output
