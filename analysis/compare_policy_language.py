@@ -141,9 +141,10 @@ def parse_policy_key(name: str) -> str | None:
 
 
 def safe_slug(value: str) -> str:
+    """Return a safe, visible filename component."""
     value = value.strip().replace(" ", "_")
     value = re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
-    return value.strip("_") or "policy"
+    return value.strip("._-") or "policy"
 
 
 def extract_pdf_text(pdf_path: Path) -> str:
@@ -231,30 +232,85 @@ def remove_web_noise(text: str) -> str:
     return "\n".join(cleaned_lines)
 
 
-def fuzzy_phrase_pattern(phrase: str) -> re.Pattern[str]:
-    """Match a heading even when PDF layout extraction inserts spaces inside words."""
-    words = re.findall(r"[A-Za-z]+", phrase)
-    word_patterns = [r"\s*".join(re.escape(letter) for letter in word) for word in words]
-    return re.compile(r"\s+".join(word_patterns), flags=re.IGNORECASE)
+def normalize_marker_text(text: str) -> str:
+    """Normalize extracted text for reliable start/stop marker matching.
+
+    Comparisons ignore whitespace and punctuation so ordinary headings and
+    space-broken PDF text, such as ``L e g a l  R e f e r e n c e``, resolve to
+    the same value. This compact form is used only for known marker matching.
+    """
+    return re.sub(r"[^a-z0-9]+", "", text.lower())
+
+
+def _start_match_positions(text: str, marker: str) -> list[int]:
+    """Return line offsets containing a normalized policy-body start marker."""
+    positions: list[int] = []
+    normalized_marker = normalize_marker_text(marker)
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped and normalized_marker in normalize_marker_text(stripped):
+            # Starting at the line is safer than retaining navigation text that
+            # precedes the marker on malformed PDF extractions.
+            positions.append(offset + line.find(stripped))
+        offset += len(line)
+    return positions
+
+
+def _heading_match_positions(text: str, marker: str, start_index: int) -> list[int]:
+    """Return positions where a stop marker appears as a standalone heading."""
+    positions: list[int] = []
+    normalized_marker = normalize_marker_text(marker)
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        stripped = line.strip()
+        if offset >= start_index and stripped:
+            # Allow trailing heading punctuation while rejecting ordinary prose.
+            heading_candidate = re.sub(r"[:.\-]+$", "", stripped).strip()
+            if normalize_marker_text(heading_candidate) == normalized_marker:
+                positions.append(offset + line.find(stripped))
+        offset += len(line)
+    return positions
 
 
 def isolate_policy_body(text: str) -> str:
-    """Keep substantive policy language and exclude later reference sections."""
-    lower = text.lower()
+    """Keep substantive policy language and exclude later reference sections.
 
+    Stop markers are recognized only when they appear as standalone headings.
+    A truncation safeguard rejects suspiciously short slices and falls back to
+    the unsliced policy text instead of silently discarding most of the body.
+    """
     start_index = 0
-    starts = [lower.find(marker) for marker in START_MARKERS]
-    starts = [index for index in starts if index >= 0]
+    starts: list[int] = []
+    for marker in START_MARKERS:
+        starts.extend(_start_match_positions(text, marker))
     if starts:
         start_index = min(starts)
 
-    end_index = len(text)
+    candidate_ends: list[int] = []
     for marker in STOP_MARKERS:
-        match = fuzzy_phrase_pattern(marker).search(text, pos=start_index)
-        if match is not None:
-            end_index = min(end_index, match.start())
+        candidate_ends.extend(_heading_match_positions(text, marker, start_index))
 
-    return text[start_index:end_index].strip()
+    end_index = min(candidate_ends) if candidate_ends else len(text)
+    unsliced = text[start_index:].strip()
+    sliced = text[start_index:end_index].strip()
+
+    unsliced_words = len(re.findall(r"\b\w+\b", unsliced))
+    sliced_words = len(re.findall(r"\b\w+\b", sliced))
+
+    # Require a meaningful body and reject slices that remove almost everything.
+    if candidate_ends and (
+        sliced_words < 75
+        or (unsliced_words >= 150 and sliced_words / max(unsliced_words, 1) < 0.15)
+    ):
+        print(
+            "Warning: a reference-section heading was found unusually early; "
+            "ignoring that stop marker to avoid truncating the policy body.",
+            file=sys.stderr,
+        )
+        return unsliced
+
+    return sliced
 
 
 def clean_policy_text(raw_text: str) -> str:
@@ -280,17 +336,73 @@ def normalize_for_comparison(text: str) -> str:
     return text.strip()
 
 
+ABBREVIATION_PLACEHOLDERS = {
+    "e.g.": "e<prd>g<prd>",
+    "i.e.": "i<prd>e<prd>",
+    "sec.": "sec<prd>",
+    "no.": "no<prd>",
+    "cal.": "cal<prd>",
+    "gov.": "gov<prd>",
+    "dept.": "dept<prd>",
+    "ed.": "ed<prd>",
+    "inc.": "inc<prd>",
+    "u.s.": "u<prd>s<prd>",
+}
+
+
 def sentence_lines(text: str) -> list[str]:
-    """Create moderately readable lines for text-difference files."""
+    """Create readable sentence-like segments for diffs and change counts."""
     compact = re.sub(r"\s+", " ", text).strip()
     if not compact:
         return []
 
+    protected = compact
+    for abbreviation, placeholder in ABBREVIATION_PLACEHOLDERS.items():
+        protected = re.sub(
+            re.escape(abbreviation), placeholder, protected, flags=re.IGNORECASE
+        )
+
+    # Protect decimal policy and legal section numbers such as 3514.1 and 5.1.
+    protected = re.sub(r"(?<=\d)\.(?=\d)", "<prd>", protected)
+
     pieces = re.split(
         r"(?<=[.!?])\s+(?=(?:[A-Z]|\d+[.)]|[a-z][.)]))",
-        compact,
+        protected,
     )
-    return [piece.strip() for piece in pieces if piece.strip()]
+
+    restored: list[str] = []
+    for piece in pieces:
+        piece = piece.replace("<prd>", ".").strip()
+        if piece:
+            restored.append(piece)
+    return restored
+
+
+def change_counts(template_text: str, district_text: str) -> dict[str, int]:
+    """Summarize sentence-like additions, removals, replacements, and matches."""
+    template_lines = sentence_lines(template_text)
+    district_lines = sentence_lines(district_text)
+    matcher = difflib.SequenceMatcher(None, template_lines, district_lines, autojunk=False)
+
+    added = removed = replaced = unchanged = 0
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            unchanged += i2 - i1
+        elif tag == "insert":
+            added += j2 - j1
+        elif tag == "delete":
+            removed += i2 - i1
+        elif tag == "replace":
+            # Keep change categories mutually exclusive. A replaced block is
+            # reported only as replaced, not also as added and removed.
+            replaced += max(i2 - i1, j2 - j1)
+
+    return {
+        "sentences_added": added,
+        "sentences_removed": removed,
+        "sentences_replaced": replaced,
+        "sentences_unchanged": unchanged,
+    }
 
 
 def make_diff(template_text: str, district_text: str) -> str:
@@ -462,6 +574,7 @@ def analyze_with_templates(
             encoding="utf-8",
         )
 
+        counts = change_counts(best_template.clean_text, district_doc.clean_text)
         best_rows.append(
             {
                 "policy_key": policy_key,
@@ -471,6 +584,7 @@ def analyze_with_templates(
                 "adoption_type": adoption_type,
                 "district_word_count": len(district_doc.comparison_text.split()),
                 "template_word_count": len(best_template.comparison_text.split()),
+                **counts,
                 "diff_file": str(diff_path.relative_to(output_dir)),
             }
         )
@@ -496,6 +610,10 @@ def analyze_with_templates(
             "adoption_type",
             "district_word_count",
             "template_word_count",
+            "sentences_added",
+            "sentences_removed",
+            "sentences_replaced",
+            "sentences_unchanged",
             "diff_file",
         ),
         best_rows,
@@ -765,7 +883,9 @@ def main() -> int:
         required=True,
         help=(
             "Root folder containing one folder per policy. PDFs placed directly "
-            "in this root are also treated as one policy folder."
+            "in this root are also treated as one policy folder. Each directory "
+            "that directly contains PDFs is processed independently; nested "
+            "subfolders are not merged with their parent folder."
         ),
     )
     parser.add_argument(
@@ -826,7 +946,8 @@ def main() -> int:
                     "district_pdfs_analyzed": 0,
                     "matching_templates": 0,
                     "clusters": "",
-                    "errors": str(exc),
+                    "error_count": 1,
+                    "error_message": str(exc),
                 }
             )
             continue
@@ -854,7 +975,8 @@ def main() -> int:
                     "district_pdfs_analyzed": 0,
                     "matching_templates": len(template_index.get(policy_key, [])),
                     "clusters": "",
-                    "errors": error_message,
+                    "error_count": len(district_errors) + 1,
+                    "error_message": error_message,
                 }
             )
             continue
@@ -870,6 +992,35 @@ def main() -> int:
                     ("file", "error"),
                     template_errors,
                 )
+                for item in template_errors:
+                    print(
+                        f"Warning: template extraction failed for {policy_key} "
+                        f"({item['file']}): {item['error']}",
+                        file=sys.stderr,
+                    )
+
+        # A matching template that fails extraction is not the same as no template.
+        # Do not silently fall back to clustering because that would misrepresent
+        # the analysis mode.
+        if template_paths and not template_docs:
+            error_message = (
+                "Matching template file(s) were found, but none could be extracted. "
+                "Clustering was not run. See template_extraction_errors.csv."
+            )
+            print(f"Error processing {policy_key}: {error_message}", file=sys.stderr)
+            summary_rows.append(
+                {
+                    "policy_folder": relative_folder,
+                    "policy_key": policy_key,
+                    "mode": "error",
+                    "district_pdfs_analyzed": len(district_docs),
+                    "matching_templates": len(template_paths),
+                    "clusters": "",
+                    "error_count": len(district_errors) + len(template_errors),
+                    "error_message": error_message,
+                }
+            )
+            continue
 
         try:
             if template_docs:
@@ -894,7 +1045,10 @@ def main() -> int:
                     "district_pdfs_analyzed": result["policy_count"],
                     "matching_templates": result["template_count"],
                     "clusters": result["cluster_count"],
-                    "errors": len(district_errors) + len(template_errors),
+                    "error_count": len(district_errors) + len(template_errors),
+                    "error_message": "; ".join(
+                        item["error"] for item in district_errors + template_errors
+                    ),
                 }
             )
         except Exception as exc:
@@ -907,7 +1061,8 @@ def main() -> int:
                     "district_pdfs_analyzed": len(district_docs),
                     "matching_templates": len(template_docs),
                     "clusters": "",
-                    "errors": str(exc),
+                    "error_count": 1,
+                    "error_message": str(exc),
                 }
             )
 
@@ -920,7 +1075,8 @@ def main() -> int:
             "district_pdfs_analyzed",
             "matching_templates",
             "clusters",
-            "errors",
+            "error_count",
+            "error_message",
         ),
         summary_rows,
     )
