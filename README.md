@@ -15,14 +15,18 @@ pip install -r requirements.txt
 ## Run the scraper
 
 ```bash
-python scrape_policies.py --input "Summer 2026 Board Policy Indicator Refresh Data Tracker.xlsx" --sheet Caden
+python scrape_policies.py --input "Summer 2026 Board Policy Indicator Refresh Data Tracker.xlsx" --sheet Caden --inter-district-delay 8 --delay-min 3.5 --delay-max 6.5
 ```
 
 Useful options:
 
 - `--start-row 121 --end-row 200` — process a row range
 - `--limit 5` or `--pilot` — small test run
-- `--concurrency 5` — parallel districts (default 5)
+- `--concurrency 3` — parallel districts (default 3)
+
+> [!TIP]
+> **Anti-Bot Settings:** Simbli has strict Cloudflare bot-protection. To prevent massive blocks of skipped districts, always use a slow, human-paced delay. 
+> Recommended settings: `--inter-district-delay 8 --delay-min 3.5 --delay-max 6.5`
 
 Output files are created automatically:
 
@@ -71,6 +75,23 @@ Each user needs their own copy of the tracking spreadsheet (for example `Summer 
 - `test_*.py`, `debug_*.html` — development/debug scripts
 - `make_district_folders.py`, `rename_pdfs.py` — unrelated utilities
 
+# Download district policy pdfs
+Run this command (this will create a folder called 'Ten Strands' in your current directory and in that folder, download policy pdfs by policy). It will skip districts that have already been downloaded
+```bash
+python download_pdfs.py --input "Summer 2026 Board Policy Indicator Refresh Data Tracker.xlsx" --sheet Caden --start-row 3 --end-row 315 --chrome-version 149
+```
+---
+
+
+### Run
+
+From inside that `Ten Strands` folder:
+`python reorganize_by_policy.py`
+### Output
+
+Creates a new folder called By Policy alongside the district folders inside Ten Strands. Inside By Policy, there's one subfolder per canonical policy (for example "AR 3511.1 Integrated Waste Management" or "BP 3510 Green Schools Operations"), and each of those subfolders contains copies of every district's PDF for that policy.
+
+At the end of the run, the script prints how many PDFs were successfully copied out of the total found (e.g. `Copied 280/312 PDF(s)`), plus a list of any skipped files and why.
 ## Notes
 
 - Simbli scraping opens a real Chrome window via `undetected-chromedriver`.

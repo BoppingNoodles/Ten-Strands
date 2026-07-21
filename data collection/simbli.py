@@ -146,7 +146,11 @@ def _get_policy_listing_api_rows(driver: uc.Chrome, simbli_id: str) -> list[dict
               "&ismobile=false" +
               "&ptid=" + enPTID +
               "&secid=" + enSectionID;
-            fetch(api, { headers: { Authorization: `Bearer ${getCoreAuthTokenFromCookies()}` } })
+            const headers = {};
+            const token = getCoreAuthTokenFromCookies();
+            if (token) headers['Authorization'] = `Bearer ${token}`;
+            
+            fetch(api, { headers })
               .then((response) => response.json())
               .then((data) => done(data))
               .catch((error) => done({ error: String(error) }));
@@ -452,8 +456,16 @@ def _check_policy_sync(district: DistrictRecord, policy: PolicyEntry, driver: uc
     # ── Step 1: Try the direct link from the spreadsheet ──────────────────────
     direct_status = None
     if policy.has_real_link and policy.is_simbli:
-        direct_result = _scrape_direct_link(driver, policy.link)
-        direct_status = direct_result.get("status")
+        # Simbli links with a blank secid= parameter reliably fail (navigation_failed).
+        # Skip the direct link and fall through to the index scan immediately.
+        import urllib.parse as _up
+        _qs = _up.parse_qs(_up.urlparse(policy.link).query)
+        _secid = _qs.get("secid", [""])[0].strip()
+        if _secid:
+            direct_result = _scrape_direct_link(driver, policy.link)
+            direct_status = direct_result.get("status")
+        else:
+            print(f"      [Simbli] Skipping direct link (blank secid) for {policy.policy_code}, falling back to index")
 
     if direct_status == "loaded":
         # The link is alive. Decide revised vs unchanged from any parsed dates.
@@ -514,6 +526,12 @@ def _check_policy_sync(district: DistrictRecord, policy: PolicyEntry, driver: uc
                 result.action = ScapeAction.SKIPPED
                 result.highlight_color = HighlightColor.NONE
                 result.notes = "Index empty (possible bot block) — skipped, not marked dead"
+            elif _is_safe_routes_target(policy.policy_code):
+                # Safe Routes is never highlighted; if it's absent from the index just skip
+                # rather than flagging red — the policy may exist under a variant name.
+                result.action = ScapeAction.SKIPPED
+                result.highlight_color = HighlightColor.NONE
+                result.notes = "Safe Routes policy not found in Simbli index — skipped for human review"
             else:
                 # Policy marked adopted but has no link and is absent from the
                 # district's Simbli index — flag for human review.
@@ -584,7 +602,7 @@ def _search_for_policy_sync(district: DistrictRecord, policy: PolicyEntry, drive
                 "Policy not found; normalized blank cells to 0/N/A",
             )
         elif _is_safe_routes_target(policy.policy_code):
-            _safe_routes_not_found_result(result)
+            return _safe_routes_not_found_result(result)
 
     except Exception as exc:
         result.action = ScapeAction.ERROR

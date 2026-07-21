@@ -207,6 +207,6 @@ async def search_for_policy(district: DistrictRecord, policy: PolicyEntry, sessi
             "Policy not found in BoardDocs; normalized blank cells to 0/N/A",
         )
     elif _is_safe_routes_target(policy.policy_code):
-        _safe_routes_not_found_result(result)
+        return _safe_routes_not_found_result(result)
 
     return result

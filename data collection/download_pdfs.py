@@ -2,8 +2,14 @@
 download_pdfs.py — Download a PDF for every adopted policy in a scraped workbook.
 
 Input  : a .xlsx workbook produced by the scraper (e.g. Summer_2026_Scraped_*.xlsx)
-Output : a ``Ten Strands`` parent folder in the current directory, with one
-         subfolder per district, containing the downloaded policy PDFs.
+Output : a ``Ten Strands`` parent folder in the current directory, containing a
+         ``By Policy`` subfolder with one folder per policy (e.g.
+         ``BP 3510 Green Schools Operations``), containing every district's
+         downloaded PDF for that policy. Policy folder names are taken from a
+         canonical list (CANONICAL_POLICIES below) keyed on policy type +
+         number, so title-wording differences across districts don't create
+         duplicate folders. Any policy code not in that list still gets a
+         folder, auto-named from its own code and title.
 
 Naming convention (one file per adopted policy):
     <BP/AR>_<Policy Number>_<Policy Title>_<County>_<District>_<Year Adopted>_<Year Revised>.pdf
@@ -61,6 +67,29 @@ from models import POLICY_DEFS
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 PARENT_FOLDER = "Ten Strands"
+POLICY_SUBFOLDER = "By Policy"
+
+# Canonical (doctype, policy number) -> folder name. Keeps every district's PDF
+# for the same policy in one folder regardless of small title-wording
+# differences between districts. Policy codes not found here still get a
+# folder — it's just auto-named from the code + title instead (see
+# get_policy_folder_name below).
+CANONICAL_POLICIES = {
+    ("AR", "3511.1"): "AR 3511.1 Integrated Waste Management",
+    ("AR", "3514"): "AR 3514 Environmental Safety",
+    ("AR", "3514.1"): "AR 3514.1 Hazardous Substances",
+    ("AR", "3514.2"): "AR 3514.2 Integrated Pest Management",
+    ("AR", "5142.2"): "AR 5142.2 Safe Routes to School",
+    ("AR", "7110"): "AR 7110 Facilities Master Plan",
+    ("BP", "3510"): "BP 3510 Green Schools Operations",
+    ("BP", "3511"): "BP 3511 Energy and Water Management",
+    ("BP", "3511.1"): "BP 3511.1 Integrated Waste Management",
+    ("BP", "3514"): "BP 3514 Environmental Safety",
+    ("BP", "3514.1"): "BP 3514.1 Hazardous Substances",
+    ("BP", "5142.2"): "BP 5142.2 Safe Routes to School",
+    ("BP", "6142.5"): "BP 6142.5 Environmental Education",
+    ("BP", "7110"): "BP 7110 Facilities Master Plan",
+}
 
 
 # ── Filename helpers ──────────────────────────────────────────────────────────
@@ -122,6 +151,25 @@ def build_filename(policy_code: str, policy_title: str, county: str,
         normalize_year(year_revised),
     ]
     return "_".join(parts) + ".pdf"
+
+
+def get_policy_folder_name(policy_code: str, policy_title: str) -> Optional[str]:
+    """
+    Resolve the destination policy folder name for a policy code.
+
+    Looks up (doc_type, policy_number) in CANONICAL_POLICIES first. If not
+    found, auto-generates a folder name from the code + title so the policy
+    still gets its own folder instead of being skipped.
+    Returns None only if the code isn't a valid BP/AR code (e.g. resolutions).
+    """
+    doc_type, policy_number = parse_doc_type_and_number(policy_code)
+    if not doc_type or not policy_number:
+        return None
+    canonical = CANONICAL_POLICIES.get((doc_type, policy_number))
+    if canonical:
+        return canonical
+    auto_name = f"{doc_type} {policy_number} {sanitize(policy_title) or 'Untitled'}"
+    return sanitize(auto_name)
 
 
 # ── Workbook predicates ───────────────────────────────────────────────────────
@@ -346,8 +394,14 @@ def process_task(driver, task: dict, base_dir: str, overwrite: bool,
         record["error"] = "Could not build filename (non-BP/AR code?)"
         return record
 
-    district_folder = os.path.join(base_dir, sanitize(task["district"]))
-    dest_path = os.path.join(district_folder, filename)
+    policy_folder_name = get_policy_folder_name(task["policy_code"], task["policy_title"])
+    if not policy_folder_name:
+        record["status"] = "failed"
+        record["error"] = "Could not resolve policy folder (non-BP/AR code?)"
+        return record
+
+    policy_folder = os.path.join(base_dir, POLICY_SUBFOLDER, policy_folder_name)
+    dest_path = os.path.join(policy_folder, filename)
     record["dest"] = dest_path
 
     if os.path.exists(dest_path) and not overwrite:
@@ -360,7 +414,7 @@ def process_task(driver, task: dict, base_dir: str, overwrite: bool,
         record["method"] = "direct" if is_direct_pdf(task["link"]) else "chrome"
         return record
 
-    os.makedirs(district_folder, exist_ok=True)
+    os.makedirs(policy_folder, exist_ok=True)
     # Avoid clobbering an existing differently-sourced file when re-running.
     dest_path = unique_path(dest_path)
     record["dest"] = dest_path
@@ -450,15 +504,20 @@ def main() -> None:
     need_chrome = any(not is_direct_pdf(t["link"]) for t in tasks) and not args.dry_run
 
     driver = None
+    get_driver = None
     if need_chrome:
         import undetected_chromedriver as uc
-        print("Initializing Chrome for HTML->PDF rendering...")
-        options = uc.ChromeOptions()
-        kwargs = {"options": options}
-        if args.chrome_version:
-            kwargs["version_main"] = args.chrome_version
-        driver = uc.Chrome(**kwargs)
-        driver.set_page_load_timeout(45)
+        def _create_driver():
+            print("Initializing Chrome for HTML->PDF rendering...")
+            options = uc.ChromeOptions()
+            kwargs = {"options": options}
+            if args.chrome_version:
+                kwargs["version_main"] = args.chrome_version
+            d = uc.Chrome(**kwargs)
+            d.set_page_load_timeout(45)
+            return d
+        get_driver = _create_driver
+        driver = get_driver()
 
     # ── Run ──────────────────────────────────────────────────────────────────
     results = []
@@ -466,9 +525,33 @@ def main() -> None:
     try:
         total = len(tasks)
         for i, task in enumerate(tasks, 1):
+            # Preemptively recycle the browser every 100 tasks to prevent memory leaks
+            if need_chrome and i > 1 and i % 100 == 0:
+                print("Recycling Chrome instance to free memory...")
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+                driver = get_driver()
+
             prefix = f"[{i}/{total}] {task['district']} | {task['policy_code']}"
-            rec = process_task(driver, task, base_dir,
-                               overwrite=args.overwrite, dry_run=args.dry_run)
+            
+            for attempt in range(2):
+                rec = process_task(driver, task, base_dir,
+                                   overwrite=args.overwrite, dry_run=args.dry_run)
+                
+                # If the browser crashed, restart it and retry the task once
+                if rec["status"] == "failed" and "InvalidSessionIdException" in str(rec.get("error", "")):
+                    if attempt == 0 and need_chrome:
+                        print(f"  Browser crashed (InvalidSessionIdException). Restarting Chrome and retrying...")
+                        try:
+                            driver.quit()
+                        except Exception:
+                            pass
+                        driver = get_driver()
+                        continue
+                break
+
             results.append(rec)
             counts[rec["status"]] = counts.get(rec["status"], 0) + 1
 
