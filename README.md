@@ -78,7 +78,7 @@ Each user needs their own copy of the tracking spreadsheet (for example `Summer 
 # Download district policy pdfs
 Run this command (this will create a folder called 'Ten Strands' in your current directory and in that folder, download policy pdfs by policy). It will skip districts that have already been downloaded
 ```bash
-python download_pdfs.py --input "Summer 2026 Board Policy Indicator Refresh Data Tracker.xlsx" --sheet Caden --start-row 3 --end-row 315 --chrome-version 149
+python download_pdfs.py --input "Summer 2026 Board Policy Indicator Refresh Data Tracker.xlsx" --sheet Caden --start-row 3 --end-row 315
 ```
 ---
 
